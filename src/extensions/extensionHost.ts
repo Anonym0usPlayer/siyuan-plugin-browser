@@ -1,6 +1,7 @@
 import { Dialog, showMessage } from "siyuan";
 import type { IWebviewTag } from "../types";
 import { parseExtensionPackage } from "./crx";
+import { downloadEdgeCrx, fetchEdgeAddonMeta, parseEdgeAddonId } from "./edgeStore";
 import { remoteSession } from "../utils/electron";
 
 /**
@@ -345,9 +346,13 @@ export class ExtensionHost {
         }
     }
 
-    /** 输入路径智能安装：CRX/ZIP 文件按包安装，目录按未打包扩展安装 */
+    /** 输入路径智能安装：CRX/ZIP 文件按包安装，目录按未打包扩展安装；Edge 加载项链接 / 扩展 ID 走商店下载 */
     async installFromInput(rawPath: string): Promise<{ ok: boolean; error?: string; ext?: IInstalledExtension }> {
         const { fs } = nodeModules();
+        // Edge 加载项商店输入优先识别（32 位 [a-p] id 或商店详情页链接，与本地路径形态不冲突）
+        if (parseEdgeAddonId(rawPath)) {
+            return await this.installFromEdgeAddons(rawPath);
+        }
         const p = this.expandPath(rawPath);
         try {
             if (fs.existsSync(p) && fs.statSync(p).isFile()) {
@@ -355,6 +360,45 @@ export class ExtensionHost {
             }
         } catch {}
         return await this.installFromPath(p);
+    }
+
+    /**
+     * 从 Microsoft Edge 加载项商店安装（https://microsoftedge.microsoft.com/addons）。
+     * 接受详情页链接或 32 位扩展 ID：下载 CRX 落盘到
+     * {petal}/extensions/download/edge-<id>.crx（路径稳定 → 同一扩展重复安装视为更新），
+     * 再走通用包安装流程解压装入。
+     */
+    async installFromEdgeAddons(rawInput: string): Promise<{ ok: boolean; error?: string; ext?: IInstalledExtension }> {
+        const { fs, path } = nodeModules();
+        const id = parseEdgeAddonId(rawInput);
+        if (!id) {
+            return { ok: false, error: "invalid Edge Add-ons URL or extension id: " + String(rawInput).slice(0, 200) };
+        }
+        // 元数据仅用于错误提示增强与后续展示，获取失败不影响安装
+        const meta = await fetchEdgeAddonMeta(id);
+        try {
+            const buf = await downloadEdgeCrx(id);
+            const workspaceDir = (window as any).siyuan?.config?.system?.workspaceDir;
+            if (!workspaceDir) {
+                return { ok: false, error: "workspaceDir unavailable" };
+            }
+            const downloadDir = path.join(
+                workspaceDir,
+                "data",
+                "storage",
+                "petal",
+                this.plugin?.name || "siyuan-plugin-browser",
+                "extensions",
+                "download"
+            );
+            fs.mkdirSync(downloadDir, { recursive: true });
+            const crxFile = path.join(downloadDir, `edge-${id}.crx`);
+            fs.writeFileSync(crxFile, buf);
+            return await this.installFromPackage(crxFile);
+        } catch (e: any) {
+            const name = meta?.name ? ` (${meta.name})` : "";
+            return { ok: false, error: `Edge Add-ons${name}: ${String(e?.message || e)}` };
+        }
     }
 
     async uninstall(id: string): Promise<void> {
@@ -676,6 +720,51 @@ export class ExtensionHost {
             });
             toolbar.appendChild(manualBtn);
             container.appendChild(toolbar);
+
+            // Edge 加载项商店安装行：粘贴详情页链接或扩展 ID 直接下载安装
+            const edgeToolbar = document.createElement("div");
+            edgeToolbar.style.cssText = "display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap;";
+            const edgeInput = document.createElement("input");
+            edgeInput.className = "b3-text-field";
+            edgeInput.style.flex = "1";
+            edgeInput.style.minWidth = "240px";
+            edgeInput.placeholder =
+                i18n.extEdgePlaceholder ||
+                "https://microsoftedge.microsoft.com/addons/detail/... 或扩展 ID";
+            edgeInput.addEventListener("keydown", (ev) => {
+                if (ev.key === "Enter") {
+                    edgeBtn.click();
+                }
+            });
+            edgeToolbar.appendChild(edgeInput);
+            const edgeBtn = document.createElement("button");
+            edgeBtn.className = "b3-button";
+            edgeBtn.textContent = i18n.extEdgeInstall || "从 Edge 加载项安装";
+            edgeBtn.addEventListener("click", async () => {
+                const v = edgeInput.value.trim();
+                if (!v) {
+                    edgeInput.focus();
+                    return;
+                }
+                edgeBtn.disabled = true;
+                const originalText = edgeBtn.textContent;
+                edgeBtn.textContent = i18n.extEdgeDownloading || "下载中...";
+                try {
+                    const r = await this.installFromEdgeAddons(v);
+                    if (r.ok) {
+                        edgeInput.value = "";
+                        showMessage((i18n.extInstalled || "已安装扩展") + ": " + r.ext!.name, 3000, "info");
+                        render();
+                    } else {
+                        showMessage((i18n.extInstallFailed || "安装扩展失败") + ": " + r.error, 6000, "error");
+                    }
+                } finally {
+                    edgeBtn.disabled = false;
+                    edgeBtn.textContent = originalText;
+                }
+            });
+            edgeToolbar.appendChild(edgeBtn);
+            container.appendChild(edgeToolbar);
 
             const list = this.list();
             if (list.length === 0) {
