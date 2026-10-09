@@ -27,6 +27,8 @@ export interface BrowserTabDeps {
     onTabIconChange: (icon: string) => void;
     /** Chrome 扩展内容脚本注入（每次 webview 页面 dom-ready 时调用） */
     injectExtensions?: (webview: IWebviewTag, url: string) => void;
+    /** Edge 加载项商店安装（详情页悬浮按钮 / 协议跳转拦截触发） */
+    installEdgeExtension?: (id: string, source: string) => Promise<{ ok: boolean; error?: string; ext?: any } | void>;
 }
 
 /**
@@ -114,6 +116,8 @@ export class BrowserTab {
                         },
                     }, this.deps.i18n);
                 },
+                onEdgeInstall: (id: string, source: string) =>
+                    this.deps.installEdgeExtension?.(id, source) ?? Promise.resolve(),
             },
         });
 

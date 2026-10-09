@@ -1,7 +1,7 @@
 import { Dialog, showMessage } from "siyuan";
 import type { IWebviewTag } from "../types";
 import { parseExtensionPackage } from "./crx";
-import { downloadEdgeCrx, fetchEdgeAddonMeta, parseEdgeAddonId } from "./edgeStore";
+import { EDGE_ADDONS_HOME, downloadEdgeCrx, fetchEdgeAddonMeta, parseEdgeAddonId } from "./edgeStore";
 import { remoteSession } from "../utils/electron";
 
 /**
@@ -648,6 +648,16 @@ export class ExtensionHost {
         return null;
     }
 
+    /** 在插件浏览器中打开 Edge 加载项商店（浏览扩展，详情页点"安装到思源"即可安装） */
+    openEdgeStore(): void {
+        const plugin = (window as any).browserPlugin;
+        if (plugin?.openUrl) {
+            plugin.openUrl(EDGE_ADDONS_HOME);
+        } else {
+            window.open(EDGE_ADDONS_HOME, "_blank");
+        }
+    }
+
     /** 扩展管理对话框 */
     openManager(i18n: Record<string, string>): void {
         const dialog = new Dialog({
@@ -764,6 +774,12 @@ export class ExtensionHost {
                 }
             });
             edgeToolbar.appendChild(edgeBtn);
+            // 打开商店：在插件浏览器里浏览扩展，详情页点"安装到思源"直接安装
+            const openStoreBtn = document.createElement("button");
+            openStoreBtn.className = "b3-button b3-button--cancel";
+            openStoreBtn.textContent = i18n.extOpenStore || "打开 Edge 加载项商店";
+            openStoreBtn.addEventListener("click", () => this.openEdgeStore());
+            edgeToolbar.appendChild(openStoreBtn);
             container.appendChild(edgeToolbar);
 
             const list = this.list();

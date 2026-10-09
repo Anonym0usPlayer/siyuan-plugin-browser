@@ -18,10 +18,15 @@
  * 纯 Node 测试环境预置 globalThis.window = { require } 即可复用）。
  */
 
+/** 商店首页（在插件浏览器内浏览、点扩展安装的入口） */
+export const EDGE_ADDONS_HOME = "https://microsoftedge.microsoft.com/addons/Microsoft-Edge-Extensions-Home";
+
 /** Edge/Chrome 扩展 id 字符集固定为 a-p 共 16 个字母 */
 const ADDON_ID_RE = /^[a-p]{32}$/i;
 /** 详情页 https://microsoftedge.microsoft.com/addons/detail/<slug>/<id>（slug 可省略） */
 const DETAIL_URL_RE = /microsoftedge\.microsoft\.com\/addons\/detail\/(?:[^/?#]+\/)?([a-p]{32})/i;
+/** CRX 直链（商店"获取"按钮的另一种落点） */
+const CRX_URL_RE = /^https?:\/\/edge\.microsoft\.com\/extensionwebstorebase\/v1\/crx/i;
 
 const DEFAULT_MAX_BYTES = 512 * 1024 * 1024;
 const DEFAULT_TIMEOUT_MS = 60_000;
@@ -53,6 +58,34 @@ export function parseEdgeAddonId(input: string): string | null {
     if (ADDON_ID_RE.test(s)) return s.toLowerCase();
     const m = s.match(DETAIL_URL_RE);
     if (m) return m[1].toLowerCase();
+    return null;
+}
+
+/**
+ * 从商店"获取"按钮触发的导航落点解析扩展 id（在插件内点获取即安装）：
+ * - microsoft-edge: 协议跳转（非 Edge 浏览器中"获取"按钮的默认行为）
+ *   形如 microsoft-edge:https://microsoftedge.microsoft.com/addons/detail/<slug>/<id>
+ *   或 microsoft-edge:addons/detail/<slug>/<id>
+ * - CRX 直链导航 https://edge.microsoft.com/extensionwebstorebase/v1/crx?...&x=id%3D<id>%26...
+ * 其余返回 null。
+ */
+export function parseEdgeInstallNavigation(url: string): string | null {
+    const s = String(url || "").trim();
+    if (!s) return null;
+    if (/^microsoft-edge:/i.test(s)) {
+        const rest = s.slice("microsoft-edge:".length);
+        const m = rest.match(/addons\/detail\/(?:[^/?#]+\/)?([a-p]{32})/i);
+        return m ? m[1].toLowerCase() : null;
+    }
+    if (CRX_URL_RE.test(s)) {
+        try {
+            const x = new URL(s).searchParams.get("x") || "";
+            const m = x.match(/id=([a-p]{32})/i);
+            return m ? m[1].toLowerCase() : null;
+        } catch {
+            return null;
+        }
+    }
     return null;
 }
 

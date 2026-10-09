@@ -2,6 +2,7 @@ import type { BrowserSettings, HistoryEntry, IWebviewTag } from "../types";
 import type { HistoryStore } from "../storage/historyStore";
 import type { BookmarksStore } from "../storage/bookmarksStore";
 import { pickFavicon } from "../utils/favicon";
+import { parseEdgeInstallNavigation } from "../extensions/edgeStore";
 import { showWebViewContextMenu } from "./contextMenu";
 import type { IContextMenuParams } from "../types";
 
@@ -26,6 +27,8 @@ export class WebviewController {
         onInspect: () => void;
         onFindResult?: (activeMatch: number, matches: number) => void;
         onExcerpt?: (mode: "article" | "part") => void;
+        /** Edge 加载项商店安装（详情页悬浮按钮 / 协议跳转拦截触发），resolve 安装结果供按钮回写 */
+        onEdgeInstall?: (id: string, source: string) => Promise<{ ok: boolean; error?: string; ext?: any } | void>;
     };
     private disposed = false;
     private listeners: Array<{ type: string; fn: (e: any) => void }> = [];
@@ -34,6 +37,9 @@ export class WebviewController {
     /** 去重：最近一次通过任意机制（ipc/new-window/will-navigate）打开的新标签页 URL + 时间 */
     private lastNewTabUrl = "";
     private lastNewTabTime = 0;
+    /** Edge 商店安装去重（will-navigate/did-fail-load/ipc 可能对同一动作多次触发） */
+    private lastEdgeInstallId = "";
+    private lastEdgeInstallTime = 0;
     /** 最近一次已知的主框架 URL（webview 损坏后 getURL() 不可靠，重建时用它恢复） */
     private lastKnownUrl = "";
     /** 是否有导航正在进行（健康监测在加载期间跳过，避免误判） */
@@ -88,6 +94,43 @@ export class WebviewController {
         this.lastNewTabTime = now;
         console.log(`[browser-plugin] openNewTab (${source}):`, url);
         this.callbacks.onOpenNewTab(url);
+    }
+
+    /**
+     * 尝试把导航 URL 识别为 Edge 商店安装动作（microsoft-edge: 协议 / CRX 直链）。
+     * 命中则 preventDefault 并触发安装，返回 true 表示已处理。
+     */
+    private tryEdgeInstall(url: string, source: string, prevent: () => void): boolean {
+        const id = parseEdgeInstallNavigation(url);
+        if (!id) return false;
+        prevent();
+        this.triggerEdgeInstall(id, source);
+        return true;
+    }
+
+    /** 触发 Edge 商店扩展安装（带 2 秒去重），并把结果回写到详情页悬浮按钮 */
+    private triggerEdgeInstall(id: string, source: string): void {
+        const now = Date.now();
+        if (
+            this.lastEdgeInstallId === id &&
+            this.lastEdgeInstallTime &&
+            now - this.lastEdgeInstallTime < 2000
+        ) {
+            console.log(`[browser-plugin] edge install dedup (${source}):`, id);
+            return;
+        }
+        this.lastEdgeInstallId = id;
+        this.lastEdgeInstallTime = now;
+        console.log(`[browser-plugin] edge store install (${source}):`, id);
+        const setBtnState = (s: string) => {
+            this.webview
+                .executeJavaScript(`window.__syEdgeStoreSetState && window.__syEdgeStoreSetState(${JSON.stringify(s)})`)
+                .catch(() => {});
+        };
+        setBtnState("installing");
+        Promise.resolve(this.callbacks.onEdgeInstall?.(id, source))
+            .then((r) => setBtnState(r && r.ok ? "ok" : "idle"))
+            .catch(() => setBtnState("idle"));
     }
 
     attach(): void {
@@ -147,10 +190,11 @@ export class WebviewController {
             // 兼容旧版 Electron（<22）：拦截 window.open / target=_blank
             // 新版 Electron 已废弃此事件，改用 preload + ipc-message
             const url = e.url;
-            if (url) {
-                e.preventDefault?.();
-                this.openNewTabDedup(url, "new-window");
-            }
+            if (!url) return;
+            // Edge 商店"获取"按钮落点（microsoft-edge: 协议 / CRX 直链）→ 安装而非开新页签
+            if (this.tryEdgeInstall(url, "new-window", () => e.preventDefault?.())) return;
+            e.preventDefault?.();
+            this.openNewTabDedup(url, "new-window");
         });
         this.on("ipc-message", (e) => {
             // 监听 preload 脚本通过 ipcRenderer.sendToHost 发来的消息
@@ -160,12 +204,18 @@ export class WebviewController {
                 if (url) {
                     this.openNewTabDedup(url, "ipc");
                 }
+            } else if (e.channel === "browser-edge-install") {
+                // 商店详情页悬浮"安装到思源"按钮（preload 桥转发）
+                const id = e.args?.[0];
+                if (id) this.triggerEdgeInstall(String(id), "ipc");
             }
         });
         this.on("will-navigate", (e) => {
             const url = e.url;
             console.log("[browser-plugin] will-navigate:", url, "programmaticNav:", this.programmaticNav, "currentUrl:", this.webview.getURL?.());
             if (!url) return;
+            // Edge 商店"获取"按钮落点（microsoft-edge: 协议 / CRX 直链）→ 安装而非导航
+            if (this.tryEdgeInstall(url, "will-navigate", () => e.preventDefault?.())) return;
             // 编程导航（loadURL 发起）直接放行，不拦截
             if (this.programmaticNav) {
                 this.callbacks.onUrlChange(url);
@@ -188,6 +238,15 @@ export class WebviewController {
             this.callbacks.onUrlChange(url);
         });
         this.on("did-fail-load", (e) => {
+            if (e.isMainFrame && e.errorCode === -301 && e.validatedURL) {
+                // ERR_UNKNOWN_URL_SCHEME：外部协议导航失败（Electron 可能不触发 will-navigate）
+                // Edge 商店"获取"按钮的 microsoft-edge: 协议跳转兜底
+                const id = parseEdgeInstallNavigation(e.validatedURL);
+                if (id) {
+                    this.triggerEdgeInstall(id, "did-fail-load");
+                    return;
+                }
+            }
             if (e.isMainFrame && e.errorCode !== -3) {
                 // -3 是中止（用户主动导航或重定向）
                 this.showLoadFailedPage(e.errorDescription || "Load failed", e.validatedURL || "");
@@ -375,6 +434,8 @@ export class WebviewController {
         this.loading = false;
         this.lastNewTabUrl = "";
         this.lastNewTabTime = 0;
+        this.lastEdgeInstallId = "";
+        this.lastEdgeInstallTime = 0;
         this.attach();
     }
 
@@ -531,7 +592,7 @@ export class WebviewController {
             })();
         `;
         this.webview.executeJavaScript(script).catch(() => {});
-        // 启动轮询：每 300ms 检查 __pendingNewTab
+        // 启动轮询：每 300ms 检查 __pendingNewTab / __syEdgeInstall（preload 缺失时的兜底通道）
         if (this.pendingNewTabCheckTimer) return;
         this.pendingNewTabCheckTimer = setInterval(() => {
             if (this.disposed) {
@@ -539,12 +600,18 @@ export class WebviewController {
                 this.pendingNewTabCheckTimer = null;
                 return;
             }
-            this.webview.executeJavaScript("window.__pendingNewTab || null").then((url) => {
-                if (url) {
-                    this.webview.executeJavaScript("window.__pendingNewTab = null").catch(() => {});
-                    this.openNewTabDedup(url, "inject-poll");
-                }
-            }).catch(() => {});
+            this.webview
+                .executeJavaScript("({t: window.__pendingNewTab || null, e: window.__syEdgeInstall || null})")
+                .then((r: any) => {
+                    if (r && r.t) {
+                        this.webview.executeJavaScript("window.__pendingNewTab = null").catch(() => {});
+                        this.openNewTabDedup(r.t, "inject-poll");
+                    } else if (r && r.e) {
+                        this.webview.executeJavaScript("window.__syEdgeInstall = null").catch(() => {});
+                        this.triggerEdgeInstall(String(r.e), "inject-poll");
+                    }
+                })
+                .catch(() => {});
         }, 300);
     }
 

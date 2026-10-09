@@ -211,6 +211,21 @@
             true
         );
 
+        // === 4. 页面 → 宿主事件桥（白名单通道） ===
+        // 注入脚本（executeJavaScript，页面主世界）通过 CustomEvent("sy-browser-host")
+        // 把白名单内的动作转给宿主，页面本身拿不到 ipcRenderer。
+        window.addEventListener("sy-browser-host", function (ev) {
+            try {
+                const d = ev && ev.detail;
+                if (!d || typeof d.type !== "string") return;
+                if (d.type === "browser-open-new-tab" && d.payload) {
+                    openInNewTab(typeof d.payload === "string" ? d.payload : d.payload.url);
+                } else if (d.type === "browser-edge-install" && d.payload && d.payload.id) {
+                    ipcRenderer.sendToHost("browser-edge-install", String(d.payload.id));
+                }
+            } catch (e) {}
+        });
+
         // 标记已注入，便于父进程通过 executeJavaScript 验证
         window.__browserPluginPreloadInjected = true;
     } catch (err) {

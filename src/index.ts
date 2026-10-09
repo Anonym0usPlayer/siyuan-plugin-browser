@@ -19,6 +19,7 @@ import { DownloadsDock } from "./docks/DownloadsDock";
 import { SettingsDialog } from "./settings/SettingsDialog";
 import { registerShortcuts } from "./commands/shortcuts";
 import { ExtensionHost } from "./extensions/extensionHost";
+import { buildEdgeStoreHelperScript, isEdgeAddonsSiteUrl } from "./extensions/edgeStoreHelper";
 import { getFilenameFromUrl, isUrlExcluded } from "./utils/url";
 import { uid } from "./utils/dom";
 import { buildAdBlockCss } from "./browser/adblock";
@@ -129,6 +130,25 @@ export default class BrowserPlugin extends Plugin {
                             } catch (e) {
                                 console.warn("[browser-plugin] inject extensions failed:", e);
                             }
+                            try {
+                                plugin.injectEdgeStoreHelper(webview, url);
+                            } catch (e) {
+                                console.warn("[browser-plugin] inject edge store helper failed:", e);
+                            }
+                        },
+                        installEdgeExtension: (id: string, source: string) => {
+                            return plugin.extensionHost.installFromEdgeAddons(id).then((r) => {
+                                if (r.ok) {
+                                    showMessage(plugin.i18n.extInstalled + ": " + r.ext!.name, 3000, "info");
+                                } else {
+                                    showMessage(
+                                        plugin.i18n.extInstallFailed + ": " + (r.error || source),
+                                        6000,
+                                        "error"
+                                    );
+                                }
+                                return r;
+                            });
                         },
                     },
                     data.url
@@ -313,6 +333,19 @@ export default class BrowserPlugin extends Plugin {
         if (!css) return;
         Promise.resolve((webview as any).insertCSS(css)).catch((e) => {
             console.warn("[browser-plugin] ad filter insertCSS failed:", e);
+        });
+    }
+
+    /** Edge 加载项商店页内助手：详情页注入悬浮"安装到思源"按钮（幂等，非商店页面不注入） */
+    injectEdgeStoreHelper(webview: IWebviewTag, url: string): void {
+        if (!isEdgeAddonsSiteUrl(url)) return;
+        const script = buildEdgeStoreHelperScript({
+            install: this.i18n.extEdgePageInstall || "安装到思源",
+            installing: this.i18n.extEdgePageInstalling || "安装中...",
+            installed: this.i18n.extEdgePageInstalled || "已安装 ✓",
+        });
+        Promise.resolve(webview.executeJavaScript(script)).catch((e) => {
+            console.warn("[browser-plugin] edge store helper inject failed:", e);
         });
     }
 
