@@ -5,6 +5,7 @@ import {
     getActiveTab,
     fetchSyncPost,
     Setting,
+    Menu,
 } from "siyuan";
 import { TAB_TYPE, DOCK_BOOKMARKS, DOCK_HISTORY, DOCK_DOWNLOADS, DEFAULT_SETTINGS, SEARCH_ENGINES } from "./constants";
 import { BookmarksStore } from "./storage/bookmarksStore";
@@ -462,6 +463,52 @@ export default class BrowserPlugin extends Plugin {
         }
     }
 
+    /**
+     * 顶栏扩展菜单：列出有 popup 的扩展 + 管理入口。
+     *
+     * 点击扩展项时的两种路径（见 openExtensionPopup 的语义说明）：
+     * - 有活动的浏览器标签 → 面板嵌进该标签内执行，chrome.tabs 指向该页，语义正确；
+     * - 没有 → 退化为新标签直接打开 popup 页（"对当前页操作"类的按钮会失效，
+     *   但查看/修改扩展自身设置的 options 页不受影响）。
+     */
+    private showExtensionTopMenu(): void {
+        const menu = new Menu();
+        const host = this.extensionHost;
+        const actionable = host?.listActionable?.() || [];
+        if (actionable.length === 0) {
+            menu.addItem({ iconHTML: "", label: this.i18n.extEmpty || "尚未安装扩展", click: () => {} });
+        }
+        for (const ext of actionable) {
+            menu.addItem({
+                iconHTML: "",
+                label: `${ext.name}${ext.enabled ? "" : "（已停用）"}`,
+                click: () => {
+                    if (!ext.enabled) return;
+                    const tab = this.getActiveBrowserTab();
+                    if (tab) {
+                        void tab.openExtensionPopup(ext.id);
+                    } else if (ext.electronId && ext.popupPath) {
+                        this.openUrl(`chrome-extension://${ext.electronId}/${String(ext.popupPath).replace(/^\.\//, "")}`);
+                    } else {
+                        showMessage("无法打开该扩展面板", 4000, "error");
+                    }
+                },
+            });
+        }
+        if (actionable.length > 0) menu.addSeparator();
+        menu.addItem({
+            iconHTML: "",
+            label: this.i18n.extManager || "管理扩展...",
+            click: () => host?.openManager?.(this.i18n),
+        });
+        menu.addItem({
+            iconHTML: "",
+            label: this.i18n.extOpenStore || "打开 Edge 加载项商店",
+            click: () => host?.openEdgeStore?.(),
+        });
+        menu.open({ x: window.innerWidth - 220, y: 42 });
+    }
+
     /** 在当前激活的浏览器标签页中加载 URL（替换当前页）；若无则开新标签页 */
     openUrlInCurrent(url: string, opts?: { force?: boolean }): void {
         if (!opts?.force && this.isUrlExcluded(url)) {
@@ -838,6 +885,18 @@ export default class BrowserPlugin extends Plugin {
             position: "right",
             callback: () => {
                 this.openUrl(this.settingsStore.get().homepage);
+            },
+        });
+
+        // 扩展常驻入口：不依赖浏览器标签是否打开。
+        // 点击列出有 popup 的扩展；在浏览器标签上时面板嵌进该标签内（tabs 语义正确），
+        // 否则退化为新标签直接打开扩展设置页。
+        this.addTopBar({
+            icon: '<svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M20.5 11H19V7a2 2 0 0 0-2-2h-4V3.5A2.5 2.5 0 0 0 10.5 1 2.5 2.5 0 0 0 8 3.5V5H4a2 2 0 0 0-2 2v3.8h1.5A2.7 2.7 0 0 1 6.2 13.5 2.7 2.7 0 0 1 3.5 16.2H2V20a2 2 0 0 0 2 2h3.8v-1.5A2.7 2.7 0 0 1 10.5 17.8a2.7 2.7 0 0 1 2.7 2.7V22H17a2 2 0 0 0 2-2v-4h1.5a2.5 2.5 0 0 0 2.5-2.5 2.5 2.5 0 0 0-2.5-2.5z"/></svg>',
+            title: this.i18n.extManager || "Chrome 扩展",
+            position: "right",
+            callback: () => {
+                this.showExtensionTopMenu();
             },
         });
 

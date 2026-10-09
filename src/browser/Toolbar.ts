@@ -22,6 +22,24 @@ export interface ToolbarCallbacks {
     onFindInPage(text: string): void;
 }
 
+/** 扩展图标区要展示的一项 */
+export interface IToolbarExtension {
+    /** 插件内部的稳定 id */
+    id: string;
+    name: string;
+    /** 图标 URL（chrome-extension:// 或 file://）；为空时用名称首字兜底 */
+    iconUrl?: string;
+    /** 悬停提示 */
+    title: string;
+}
+
+export interface IToolbarExtCallbacks {
+    /** 列出要显示图标的扩展 */
+    list(): IToolbarExtension[];
+    /** 点击图标：宿主自行弹出面板 */
+    onClick(extId: string, anchor: HTMLElement): void;
+}
+
 /** 工具栏 UI */
 export class Toolbar {
     readonly element: HTMLElement;
@@ -37,6 +55,9 @@ export class Toolbar {
     private i18n: Record<string, string>;
     private cb: ToolbarCallbacks;
     private settings: BrowserSettings;
+    /** 扩展图标区容器（构造后由 setExtensionBar 填充） */
+    private extBar: HTMLElement;
+    private extCb?: IToolbarExtCallbacks;
 
     constructor(i18n: Record<string, string>, cb: ToolbarCallbacks, settings: BrowserSettings) {
         this.i18n = i18n;
@@ -52,7 +73,63 @@ export class Toolbar {
         this.findbar = this.element.querySelector(".sy-browser-findbar")!;
         this.findbarResult = this.element.querySelector(".sy-browser-findbar-result")!;
         this.loadingBar = this.element.querySelector(".sy-browser-loading-bar")!;
+        this.extBar = this.element.querySelector(".sy-browser-extbar")!;
         this.bindEvents();
+    }
+
+    /** 接上扩展图标数据源（没有扩展宿主时可不调，图标区保持空） */
+    setExtensionCallbacks(cb: IToolbarExtCallbacks): void {
+        this.extCb = cb;
+        this.renderExtensionBar();
+    }
+
+    /** 扩展增删/启停后重画图标区 */
+    renderExtensionBar(): void {
+        if (!this.extBar) return;
+        clearChildren(this.extBar);
+        // 常驻入口：管理扩展。无论扩展数据是否就绪、有没有装扩展都显示 ——
+        // 否则"没装扩展/数据未加载"时图标区整块消失，入口就没 了。
+        const mgrBtn = el("button", "sy-browser-extbtn");
+        mgrBtn.type = "button";
+        mgrBtn.title = this.i18n.extManager || "Chrome 扩展";
+        mgrBtn.dataset.extId = "__manager__";
+        mgrBtn.textContent = "🧩";
+        mgrBtn.addEventListener("click", (ev) => {
+            ev.preventDefault();
+            ev.stopPropagation();
+            this.extCb?.onClick("__manager__", mgrBtn);
+        });
+        this.extBar.appendChild(mgrBtn);
+
+        if (!this.extCb) return;
+        let items: IToolbarExtension[] = [];
+        try {
+            items = this.extCb.list() || [];
+        } catch {
+            return;
+        }
+        for (const ext of items) {
+            const btn = el("button", "sy-browser-extbtn");
+            btn.type = "button";
+            btn.title = ext.title || ext.name;
+            btn.dataset.extId = ext.id;
+            if (ext.iconUrl) {
+                const img = document.createElement("img");
+                img.src = ext.iconUrl;
+                img.alt = "";
+                // 图标加载失败就不占位，避免显示一个破图
+                img.addEventListener("error", () => { img.remove(); });
+                btn.appendChild(img);
+            } else {
+                btn.textContent = (ext.name || "?").trim().charAt(0).toUpperCase();
+            }
+            btn.addEventListener("click", (ev) => {
+                ev.preventDefault();
+                ev.stopPropagation();
+                this.extCb?.onClick(ext.id, btn);
+            });
+            this.extBar.appendChild(btn);
+        }
     }
 
     private build(): HTMLElement {
@@ -68,6 +145,7 @@ export class Toolbar {
                 <button class="sy-browser-btn" data-act="bookmark" title="${this.i18n.addBookmark}">☆</button>
                 <button class="sy-browser-btn" data-act="find" title="${this.i18n.findInPage}">🔍</button>
                 <button class="sy-browser-btn" data-act="openExternal" title="${this.i18n.openExternal}">↗</button>
+                <span class="sy-browser-extbar"></span>
             </div>
             <div class="sy-browser-findbar-wrap" style="display:none;">
                 <input class="sy-browser-findbar" type="text" placeholder="${this.i18n.findInPage}" spellcheck="false" />

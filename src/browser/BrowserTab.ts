@@ -13,6 +13,35 @@ import { EDGE_UA } from "../extensions/edgeStore";
 import { isEdgeAddonsSiteUrl } from "../extensions/edgeStoreHelper";
 import { BROWSER_PARTITION } from "../constants";
 import { remoteSession } from "../utils/electron";
+import { showExtensionPopupInPage, closeExtensionPopupInPage } from "./ext-popup";
+
+/** 图标文件 → data URL 缓存（key 为 path+相对路径；读失败/非图片返回 undefined 且不缓存） */
+const iconDataUrlCache = new Map<string, string>();
+
+function iconDataUrl(extPath: string, relPath: string): string | undefined {
+    const key = `${extPath}|${relPath}`;
+    const hit = iconDataUrlCache.get(key);
+    if (hit) return hit;
+    try {
+        const req = (window as any).require;
+        const fs = req("fs");
+        const path = req("path");
+        const abs = path.join(extPath, String(relPath).replace(/^\.\//, ""));
+        if (!fs.existsSync(abs)) return undefined;
+        const buf = fs.readFileSync(abs);
+        const mime = /\.png$/i.test(abs) ? "image/png"
+            : /\.jpe?g$/i.test(abs) ? "image/jpeg"
+            : /\.svg$/i.test(abs) ? "image/svg+xml"
+            : /\.gif$/i.test(abs) ? "image/gif"
+            : /\.ico$/i.test(abs) ? "image/x-icon" : "application/octet-stream";
+        if (mime === "application/octet-stream") return undefined;
+        const url = `data:${mime};base64,${buf.toString("base64")}`;
+        iconDataUrlCache.set(key, url);
+        return url;
+    } catch {
+        return undefined;
+    }
+}
 
 /** 浏览器页签实例依赖 */
 export interface BrowserTabDeps {
@@ -78,6 +107,8 @@ export class BrowserTab {
                     this.toolbar.setUrl(url);
                     this.updateBookmarkButton(url);
                     this.syncUserAgent(url);
+                    // 页面跳转后旧面板挂在已废弃的 DOM 上，直接关掉
+                    void closeExtensionPopupInPage(this.webview);
                 },
                 onTitleChange: (title) => {
                     deps.onTabTitleChange(title);
@@ -132,6 +163,39 @@ export class BrowserTab {
 
         // 把工具栏插到 webview 之前
         this.element.insertBefore(this.toolbar.element, this.webview.parentElement);
+
+        // 扩展图标区：列出有 popup 的已启用扩展，点击后在当前页内弹出面板
+        this.toolbar.setExtensionCallbacks({
+            list: () => {
+                const host = (window as any).browserPlugin?.extensionHost;
+                if (!host?.listActionable) return [];
+                return host.listActionable().map((e: any) => ({
+                    id: e.id,
+                    name: e.name,
+                    // 图标不能用 chrome-extension:// URL：icons 一般不在扩展的
+                    // web_accessible_resources 里，宿主页加载会被拒（实测两装扩展均如此）。
+                    // 扩展目录就在本机磁盘上，直接读文件转 data URL 最可靠。
+                    iconUrl: e.iconPath && e.path ? iconDataUrl(e.path, e.iconPath) : undefined,
+                    title: e.actionTitle || e.name,
+                    _raw: e,
+                }));
+            },
+            onClick: (extId, anchor) => {
+                if (extId === "__manager__") {
+                    // 常驻入口：打开扩展管理对话框（复用设置页里的同一入口）
+                    const plugin = (window as any).browserPlugin as any;
+                    plugin?.extensionHost?.openManager(this.deps.i18n);
+                    return;
+                }
+                void this.openExtensionPopup(extId, anchor);
+            },
+        });
+        // 数据晚于构造就绪的场景（恢复标签）：load 完成后重画图标区
+        try {
+            window.addEventListener("sy-browser-ext-host-loaded", () => {
+                this.toolbar.renderExtensionBar();
+            });
+        } catch {}
 
         // 监听设置变化
         deps.settings.onChange(() => {
@@ -329,6 +393,42 @@ export class BrowserTab {
             return remote.webContents.fromId(id);
         } catch {
             return null;
+        }
+    }
+
+    /**
+     * 在当前页内弹出扩展 popup 面板。
+     * 面板执行上下文就是目标页本身，popup 里的 chrome.tabs.query 返回本页、
+     * sendMessage 能被本页 content script 收到 —— 与真 Chrome 行为一致。
+     */
+    async openExtensionPopup(extId: string, anchor?: HTMLElement): Promise<void> {
+        const host = (window as any).browserPlugin?.extensionHost;
+        const ext = host?.list?.().find((e: any) => e.id === extId);
+        if (!ext) {
+            showMessage("扩展不存在或已被卸载", 3000, "error");
+            return;
+        }
+        if (!ext.native || !ext.electronId) {
+            showMessage("该扩展未以原生模式加载，无法弹出面板", 4000, "error");
+            return;
+        }
+        if (!ext.popupPath) {
+            showMessage(`「${ext.name}」没有 popup 面板`, 4000, "info");
+            return;
+        }
+        // anchor 缺省（如从思源顶栏触发）：面板落在右上角
+        const r = anchor
+            ? anchor.getBoundingClientRect()
+            : ({ right: (window.innerWidth || 1200) - 24, bottom: 48 } as DOMRect);
+        const out = await showExtensionPopupInPage({
+            webview: this.webview,
+            extPath: ext.path,
+            electronId: ext.electronId,
+            popupPath: ext.popupPath,
+            anchorRect: { right: r.right, bottom: r.bottom },
+        });
+        if (!out.ok) {
+            showMessage(`打开「${ext.name}」面板失败: ${out.error}`, 5000, "error");
         }
     }
 

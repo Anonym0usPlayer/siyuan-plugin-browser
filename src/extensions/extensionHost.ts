@@ -46,6 +46,12 @@ export interface IInstalledExtension {
     electronId?: string;
     /** 原生加载失败原因（为空且 native=false 时表示垫片模式正常） */
     nativeError?: string;
+    /** manifest.action.default_popup 的相对路径（工具栏图标点击后展示的面板） */
+    popupPath?: string;
+    /** manifest.action.default_title（图标悬停提示，缺省回退 name） */
+    actionTitle?: string;
+    /** manifest.icons 里最大尺寸的图标相对路径（工具栏显示用） */
+    iconPath?: string;
 }
 
 const EXTENSIONS_KEY = "extensions.json";
@@ -139,9 +145,155 @@ export class ExtensionHost {
         } catch {
             this.extensions = [];
         }
+        this.backfillManifestExtras();
+        this.injectBackgroundShims();
         // Electron 的 session 扩展不跨重启持久化，启动时全部恢复（原生优先，失败回退垫片）
         await this.reconcileNative();
         this.loaded = true;
+        // 数据就绪广播：思源恢复标签时 BrowserTab 可能在 load() 完成前构造，
+        // 那时画的图标区是空的 —— 监听方收到此事件后重画。
+        try {
+            window.dispatchEvent(new CustomEvent("sy-browser-ext-host-loaded"));
+        } catch {}
+    }
+
+    /**
+     * 给 MV3 扩展的 service_worker 注入兼容垫片（写回扩展目录的 background 文件）。
+     *
+     * 动机：Electron 不支持 chrome.contextMenus（依赖 Google 服务那批 API 一样缺），
+     * 而不少扩展 background 的**第一行**就是 contextMenus.create —— 不存在直接抛
+     * "Cannot read properties of undefined"，整个 service worker 起不来，
+     * 该扩展的消息监听、右键菜单全部瘫痪（实测 SiYuan Clip 因此 SW 缺席）。
+     *
+     * 垫片只补"存在性"：contextMenus 记录注册项、onClicked 转发到 storage 通道，
+     * 让 SW 至少能跑完初始化。菜单的真正触发由宿主写 storage 完成（见 contextMenu.ts）。
+     *
+     * 幂等：文件头有标记就跳过；扩展更新（文件重写）后标记消失会重新注入。
+     */
+    private injectBackgroundShims(): void {
+        const { fs, path } = nodeModules();
+        const SHIM_MARK = "/* sy-bg-shim:v2 */";
+        let changedShimCount = 0;
+        for (const ext of this.extensions) {
+            try {
+                const manifest = JSON.parse(fs.readFileSync(path.join(ext.path, "manifest.json"), "utf8"));
+                const swPath = manifest.background?.service_worker;
+                if (!swPath) continue;
+                const abs = path.join(ext.path, swPath);
+                const src = fs.readFileSync(abs, "utf8");
+                if (src.startsWith(SHIM_MARK)) continue;
+                // 只在真的用到缺失 API 时才垫（省得污染没问题的扩展）
+                const needsShim = /chrome\.(contextMenus|commands|action|browserAction|notifications|cookies|downloads|webNavigation|alarms|omnibox)/.test(src);
+                if (!needsShim) continue;
+                const shim = SHIM_MARK + `
+;(function () {
+    try {
+        if (typeof chrome === "undefined") return;
+        // 1) 通用存在性垫片：background 里引用到的缺失命名空间统一补空壳，
+        //    否则任何一处 undefined 访问都会让 SW 整个崩掉（实测 SiYuan Clip
+        //    第一行 contextMenus、中段 commands 各崩一次）。
+        var eventHub = function () {
+            var fns = [];
+            return {
+                addListener: function (fn) { if (typeof fn === "function") fns.push(fn); },
+                removeListener: function (fn) { var i = fns.indexOf(fn); if (i >= 0) fns.splice(i, 1); },
+                __emit: function () { var a = arguments; fns.forEach(function (fn) { try { fn.apply(null, a); } catch (e) {} }); },
+            };
+        };
+        var MISSING = ["contextMenus", "commands", "action", "browserAction", "pageAction",
+            "notifications", "cookies", "downloads", "webNavigation", "webRequest",
+            "declarativeNetRequest", "idle", "alarms", "permissions", "sessions",
+            "topSites", "bookmarks", "history", "omnibox", "pageCapture"];
+        MISSING.forEach(function (ns) {
+            if (chrome[ns]) return;
+            chrome[ns] = { onChanged: eventHub() };
+            // 常见事件口补 addListener（保证注册不抛）
+            ["onClicked", "onCommand", "onInstalled", "onStartup", "onChanged"].forEach(function (ev) {
+                chrome[ns][ev] = eventHub();
+            });
+        });
+        // commands 补 API 形态（manifest 里声明的快捷键注册）
+        if (chrome.commands && !chrome.commands.getAll) {
+            chrome.commands.getAll = function (cb) { cb && cb([]); };
+        }
+        // 2) contextMenus 特化：记录注册项，点击经 storage 通道由宿主触发
+        if (!chrome.contextMenus.__syStore) {
+            var store = { items: {}, click: eventHub() };
+            chrome.contextMenus.removeAll = function (cb) { store.items = {}; if (cb) cb(); };
+            chrome.contextMenus.create = function (props) { if (props && props.id) store.items[props.id] = props; };
+            chrome.contextMenus.onClicked = store.click;
+            chrome.contextMenus.__syStore = store;
+            self.__syContextMenuStore = store;
+            // 宿主点击菜单 → 写 storage → 这里触发 onClicked
+            if (chrome.storage && chrome.storage.onChanged) {
+                chrome.storage.onChanged.addListener(function (changes, area) {
+                    try {
+                        if (area !== "local" || !changes.__syMenuClick) return;
+                        var p = changes.__syMenuClick.newValue;
+                        store.click.__emit(p.info, p.tab);
+                    } catch (e) {}
+                });
+            }
+        }
+    } catch (e) {}
+})();
+`;
+                fs.writeFileSync(abs, shim + src, "utf8");
+                changedShimCount++;
+            } catch {
+                // 单个扩展垫片失败不影响其它
+            }
+        }
+        if (changedShimCount > 0) {
+            // 垫片改了 SW 源码，Electron 侧的已加载扩展需要卸掉重载 ——
+            // reconcileNative（紧随其后调用）发现原生缺席会重新 loadExtension
+            try {
+                const ses = remoteSession();
+                if (ses?.getAllExtensions && ses.unloadExtension) {
+                    for (const x of ses.getAllExtensions()) {
+                        try { ses.unloadExtension(x.id); } catch {}
+                    }
+                }
+            } catch {}
+        }
+    }
+
+    /**
+     * 给旧版本安装的扩展补齐 popupPath / actionTitle / iconPath。
+     * 这三个字段是工具栏图标功能加的，只在安装时从 manifest 解析；
+     * 存量数据里没有，读盘时按需补算，否则工具栏永远空白。
+     */
+    private backfillManifestExtras(): void {
+        const { fs, path } = nodeModules();
+        let changed = false;
+        for (const ext of this.extensions) {
+            if (ext.popupPath !== undefined && ext.iconPath !== undefined) continue;
+            try {
+                const manifest = JSON.parse(fs.readFileSync(path.join(ext.path, "manifest.json"), "utf8"));
+                if (ext.popupPath === undefined) {
+                    ext.popupPath = (manifest.action?.default_popup
+                        || manifest.browser_action?.default_popup
+                        || manifest.page_action?.default_popup
+                        || undefined);
+                }
+                if (ext.actionTitle === undefined) {
+                    ext.actionTitle = manifest.action?.default_title
+                        || manifest.browser_action?.default_title
+                        || manifest.page_action?.default_title
+                        || undefined;
+                }
+                if (ext.iconPath === undefined) {
+                    ext.iconPath = pickLargestIcon(manifest);
+                }
+                changed = true;
+            } catch {
+                // manifest 读不到（目录被删等）：留空，工具栏会跳过该项
+                ext.popupPath = ext.popupPath ?? undefined;
+                ext.iconPath = ext.iconPath ?? undefined;
+                changed = true;
+            }
+        }
+        if (changed) void this.plugin.saveData(EXTENSIONS_KEY, JSON.stringify(this.extensions));
     }
 
     /**
@@ -201,6 +353,11 @@ export class ExtensionHost {
         return [...this.extensions];
     }
 
+    /** 能弹出面板的扩展（有 action/browser_action 的 default_popup 且已启用） */
+    listActionable(): IInstalledExtension[] {
+        return this.extensions.filter((e) => e.enabled && e.popupPath);
+    }
+
     /** 解析 manifest 字段里的 __MSG_xxx__ 占位符（_locales 消息），失败时原样返回 */
     private resolveManifestString(value: string, extPath: string, defaultLocale: string): string {
         const m = String(value || "").match(/^__MSG_(.+?)__$/);
@@ -250,6 +407,17 @@ export class ExtensionHost {
                 hasBackground: !!(manifest.background || manifest.service_worker),
                 defaultLocale: manifest.default_locale || "",
                 contentScripts,
+                // MV2 的入口是 browser_action/page_action，MV3 合并为 action
+                popupPath: (manifest.action?.default_popup
+                    || manifest.browser_action?.default_popup
+                    || manifest.page_action?.default_popup
+                    || undefined),
+                actionTitle: manifest.action?.default_title
+                    || manifest.browser_action?.default_title
+                    || manifest.page_action?.default_title
+                    || undefined,
+                // 工具栏图标：取 manifest 里声明的最大尺寸
+                iconPath: pickLargestIcon(manifest),
             };
             // 同目录重复安装 → 更新
             const idx = this.extensions.findIndex((e) => e.path === ext.path);
@@ -838,4 +1006,23 @@ function escapeHtml(s: string): string {
         .replace(/</g, "&lt;")
         .replace(/>/g, "&gt;")
         .replace(/"/g, "&quot;");
+}
+
+/**
+ * 从 manifest 取工具栏图标路径。
+ * icons 可以是 {"16": "...", "48": "...", "128": "..."} 这种尺寸映射，
+ * 也可能是数组（旧格式）或直接字符串。取声明的最大尺寸，缩放前细节最好。
+ */
+function pickLargestIcon(manifest: any): string | undefined {
+    const icons = manifest?.icons || manifest?.action?.default_icon
+        || manifest?.browser_action?.default_icon || manifest?.page_action?.default_icon;
+    if (!icons) return undefined;
+    if (typeof icons === "string") return icons;
+    if (Array.isArray(icons)) return icons.length ? String(icons[icons.length - 1]) : undefined;
+    if (typeof icons !== "object") return undefined;
+    const sizes = Object.keys(icons)
+        .map((k) => parseInt(k, 10))
+        .filter((n) => !Number.isNaN(n))
+        .sort((a, b) => b - a);
+    return sizes.length ? String(icons[String(sizes[0])]) : undefined;
 }

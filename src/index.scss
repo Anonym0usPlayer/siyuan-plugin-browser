@@ -72,6 +72,50 @@
     color: var(--b3-theme-primary);
 }
 
+// 扩展图标区：贴在工具栏行右侧，与原生按钮同高
+.sy-browser-extbar {
+    flex: 0 0 auto;
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    margin-left: 2px;
+    // 与右侧最后一个按钮之间画一条分隔线（图标区是"另一组"东西）
+    border-left: 1px solid var(--b3-border-color);
+    padding-left: 4px;
+
+    &:empty {
+        display: none;
+    }
+}
+
+.sy-browser-extbtn {
+    flex: 0 0 auto;
+    width: 26px;
+    height: 26px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    background: transparent;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    padding: 0;
+    color: var(--b3-theme-on-surface);
+    font-size: 12px;
+    font-weight: 600;
+
+    &:hover {
+        background-color: var(--b3-list-hover);
+    }
+
+    img {
+        width: 16px;
+        height: 16px;
+        object-fit: contain;
+        display: block;
+    }
+}
+
 .sy-browser-urlbar {
     flex: 1 1 auto;
     min-width: 100px;
