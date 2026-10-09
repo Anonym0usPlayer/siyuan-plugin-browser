@@ -13,9 +13,11 @@
     "build:kernel": "webpack --config webpack.kernel.config.js --mode production",
     "zip": "node scripts/zip.js"
   },
+  "dependencies": {
+    "adm-zip": "^0.6.0"
+  },
   "devDependencies": {
     "@types/node": "^22.10.2",
-    "adm-zip": "^0.6.0",
     "copy-webpack-plugin": "^12.0.2",
     "css-loader": "^7.1.4",
     "esbuild-loader": "^4.4.3",

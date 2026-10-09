@@ -1,0 +1,30 @@
+! 思源浏览器插件 - 内置广告隐藏规则（元素隐藏，不含网络拦截）
+! 语法：##通用选择器 / 域名##选择器 / 域名#@#例外选择器 / ! 注释
+! 仅收录高置信度规则；其他站点可在"设置 → 自定义广告规则"自行添加，
+! 或直接粘贴 EasyList China 等公开列表的元素隐藏部分（## 规则）。
+!
+! ===== 通用（广告网络特征）=====
+##ins.adsbygoogle
+##iframe[src*="doubleclick.net"]
+##iframe[src*="googlesyndication.com"]
+##iframe[src*="googleadservices.com"]
+##[id^="google_ads_"]
+##[id^="aswift_"]
+##div[id^="div-gpt-ad"]
+##iframe[src*="pos.baidu.com"]
+##iframe[src*="cpro.baidu.com"]
+##iframe[src*="miaozhen.com"]
+##iframe[src*="tanx.com"]
+##iframe[src*="mediav.com"]
+!
+! ===== tgb.cn 淘股吧（按实际页面核对）=====
+tgb.cn###tcAd
+tgb.cn###publisherAd
+tgb.cn###addtgbGggao
+tgb.cn###headerggContent
+tgb.cn##.wangxinban
+!
+! ===== 其他站点 =====
+zhihu.com##.Pc-word
+zhihu.com##.Pc-feed-ad
+csdn.net##div[id^="kp_box_"]

@@ -20,6 +20,8 @@ export class HistoryStore {
         } catch {
             this.items = [];
         }
+        // Dock 面板在布局构建期就已 init 并订阅，数据此时才到达，必须通知刷新
+        this.notify();
     }
 
     async save(): Promise<void> {

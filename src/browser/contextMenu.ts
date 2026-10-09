@@ -14,7 +14,7 @@ export function showWebViewContextMenu(
         openInNewTab?: (url: string) => void;
         saveAs?: (url: string, suggestedName?: string) => void;
         copyImage?: (src: string) => void;
-        excerpt?: () => void;
+        excerpt?: (mode: "article" | "part") => void;
     }
 ): void {
     const menu = new Menu("sy-browser-ctx-menu");
@@ -94,13 +94,21 @@ export function showWebViewContextMenu(
 
     menu.addSeparator();
 
-    // 摘录到思源
+    // 摘录到思源（与官方剪藏扩展一致：整页走 Readability，选区复制 Markdown 到剪贴板）
     menu.addItem({
-        id: "excerpt",
+        id: "excerptArticle",
         iconHTML: iconExcerpt(),
         label: i18n.excerpt || "摘录到思源",
-        click: () => callbacks.excerpt?.(),
+        click: () => callbacks.excerpt?.("article"),
     });
+    if (params.selectionText) {
+        menu.addItem({
+            id: "excerptPart",
+            iconHTML: iconExcerpt(),
+            label: i18n.excerptSelection || "摘录选区到剪贴板",
+            click: () => callbacks.excerpt?.("part"),
+        });
+    }
 
     // 查看源代码
     menu.addItem({

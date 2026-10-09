@@ -1,142 +1,71 @@
 import { fetchSyncPost, showMessage } from "siyuan";
+import readabilitySource from "../assets/Readability.js";
+import clipScriptSource from "../assets/clipScript.js";
 
 /**
- * 网页摘录：提取网页正文 → 转为 Markdown → 在思源指定笔记本下创建新文档。
+ * 网页摘录：与思源官方浏览器剪藏扩展（siyuan-chrome）效果保持一致。
+ *
+ * 管线：
+ * 1. 在 webview 页面上下文执行 clipScript.js（+ Readability.js）：
+ *    Readability 提取正文（含官方扩展的全部前处理），收集图片转 base64
+ * 2. 调用内核 /api/extension/copy（lute 把 DOM 转 Markdown，并按开关下载资源文件）
+ * 3. 整页摘录：按官方默认模板组装 Markdown，/api/filetree/createDocWithMd 建文档
+ *    选区摘录：Markdown 复制到剪贴板（与官方扩展行为一致）
+ * 4. 图片抓取失败时调用 /api/format/netImg2LocalAssets 兜底转换
  */
 
-/**
- * 注入到 webview 中提取网页正文。
- * 使用简化可靠的策略：article/main 容器 → innerText 提取纯文本，
- * 保留标题、链接、图片（Markdown 格式），避免复杂的 HTML→MD 转换出错。
- */
-const EXTRACT_SCRIPT = `
-(function() {
-    var result = { title: document.title || "", url: location.href, content: "" };
+/** 剪藏前处理选项（对应官方扩展 exp 选项，默认全部关闭） */
+export interface ClipExpOptions {
+    bold: boolean;
+    italic: boolean;
+    underline: boolean;
+    removeImgLink: boolean;
+    span: boolean;
+    svgToImg: boolean;
+}
 
-    // 1. 选择正文容器
-    var article = document.querySelector("article")
-        || document.querySelector("main")
-        || document.querySelector("[role=main]")
-        || document.querySelector(".post-content, .article-content, .entry-content, .content, #content");
+export interface ClipOptions {
+    mode: "article" | "part";
+    notebookId: string;
+    /** 保存路径（人类可读路径，如 /父文档/子文档，默认 / 根下）；支持 {{...}} sprig 模板 */
+    parentPath: string;
+    /** 标签（逗号分隔） */
+    tags: string;
+    /** 是否下载资源文件到思源 assets */
+    assets: boolean;
+    exp: ClipExpOptions;
+}
 
-    if (!article) {
-        // 兜底：取文本密度最大的元素
-        var best = null, bestLen = 0;
-        var candidates = document.querySelectorAll("div, section");
-        for (var i = 0; i < candidates.length; i++) {
-            var el = candidates[i];
-            if (el.closest("nav, header, footer, aside, script, style, noscript")) continue;
-            var text = el.innerText || "";
-            if (text.length > bestLen) {
-                bestLen = text.length;
-                best = el;
-            }
-        }
-        article = best || document.body;
-    }
-
-    if (!article) return JSON.stringify(result);
-
-    // 2. 克隆节点并清理无关元素
-    var clone = article.cloneNode(true);
-    var removes = clone.querySelectorAll("script, style, noscript, iframe, nav, header, footer, aside, form, button, .ad, .ads, .advertisement, .share, .comment, .related, .recommend");
-    removes.forEach(function(el) { el.remove(); });
-
-    // 3. 提取 Markdown：遍历节点，按标签类型转换
-    function htmlToMd(node) {
-        var md = "";
-        for (var i = 0; i < node.childNodes.length; i++) {
-            var child = node.childNodes[i];
-            if (child.nodeType === 3) {
-                // 文本节点
-                md += (child.textContent || "").replace(/\\s+/g, " ");
-            } else if (child.nodeType === 1) {
-                var tag = child.tagName.toLowerCase();
-                var inner = htmlToMd(child);
-                switch (tag) {
-                    case "h1": md += "\\n\\n# " + inner.trim() + "\\n\\n"; break;
-                    case "h2": md += "\\n\\n## " + inner.trim() + "\\n\\n"; break;
-                    case "h3": md += "\\n\\n### " + inner.trim() + "\\n\\n"; break;
-                    case "h4": md += "\\n\\n#### " + inner.trim() + "\\n\\n"; break;
-                    case "h5": md += "\\n\\n##### " + inner.trim() + "\\n\\n"; break;
-                    case "h6": md += "\\n\\n###### " + inner.trim() + "\\n\\n"; break;
-                    case "p": md += "\\n\\n" + inner.trim() + "\\n\\n"; break;
-                    case "br": md += "\\n"; break;
-                    case "hr": md += "\\n\\n---\\n\\n"; break;
-                    case "strong": case "b": md += "**" + inner + "**"; break;
-                    case "em": case "i": md += "*" + inner + "*"; break;
-                    case "code": md += "\`" + inner + "\`"; break;
-                    case "pre": md += "\\n\\n\`\`\`\\n" + inner.trim() + "\\n\`\`\`\\n\\n"; break;
-                    case "blockquote":
-                        var lines = inner.trim().split("\\n");
-                        for (var j = 0; j < lines.length; j++) { lines[j] = "> " + lines[j]; }
-                        md += "\\n" + lines.join("\\n") + "\\n\\n";
-                        break;
-                    case "a":
-                        var href = child.getAttribute("href") || "";
-                        md += "[" + inner.trim() + "](" + href + ")";
-                        break;
-                    case "img":
-                        var src = child.getAttribute("src") || child.getAttribute("data-src") || "";
-                        var alt = child.getAttribute("alt") || "";
-                        if (src) md += "![" + alt + "](" + src + ")";
-                        break;
-                    case "ul": case "ol":
-                        var items = child.children;
-                        for (var k = 0; k < items.length; k++) {
-                            if (items[k].tagName.toLowerCase() === "li") {
-                                var prefix = tag === "ol" ? (k + 1) + ". " : "- ";
-                                md += "\\n" + prefix + htmlToMd(items[k]).trim();
-                            }
-                        }
-                        md += "\\n\\n";
-                        break;
-                    case "li": md += inner; break;
-                    case "div": case "section": case "span": md += inner; break;
-                    default: md += inner;
-                }
-            }
-        }
-        return md;
-    }
-
-    result.content = htmlToMd(clone).replace(/\\n{3,}/g, "\\n\\n").trim();
-
-    // 4. 兜底：如果转换后内容为空，直接用 innerText
-    if (!result.content) {
-        result.content = (article.innerText || "").trim();
-    }
-
-    return JSON.stringify(result);
-})();
-`;
-
-export interface ExcerptResult {
+interface ClipPayload {
+    ok: boolean;
+    error?: string;
+    mode?: string;
+    dom: string;
+    files: Record<string, { type: string; data: string }>;
     title: string;
-    url: string;
-    content: string;
+    siteName: string;
+    excerpt: string;
+    href: string;
+    fetchFileErr: boolean;
 }
 
-/** 从 webview 提取网页正文 */
-export async function extractPageContent(webview: any): Promise<ExcerptResult | null> {
-    try {
-        const json = await webview.executeJavaScript(EXTRACT_SCRIPT);
-        console.log("[browser-plugin] extractPageContent raw result:", typeof json, (typeof json === "string" ? json.slice(0, 200) : json));
-        const result = typeof json === "string" ? JSON.parse(json) : json;
-        console.log("[browser-plugin] extractPageContent parsed:", {
-            title: result.title,
-            url: result.url,
-            contentLen: (result.content || "").length,
-            contentPreview: (result.content || "").slice(0, 100),
-        });
-        return result as ExcerptResult;
-    } catch (e) {
-        console.error("[browser-plugin] extractPageContent failed:", e);
-        return null;
-    }
+/** 在 webview 中执行剪藏脚本，返回收集结果 */
+async function runClipScript(webview: any, opts: ClipOptions): Promise<ClipPayload> {
+    const config = {
+        mode: opts.mode,
+        assets: opts.assets,
+        exp: opts.exp,
+    };
+    const script =
+        "window.__syBrowserClipConfig = " + JSON.stringify(config) + ";\n" +
+        readabilitySource + "\n;\n" +
+        clipScriptSource;
+    const raw = await webview.executeJavaScript(script);
+    const payload = typeof raw === "string" ? JSON.parse(raw) : raw;
+    return payload as ClipPayload;
 }
 
-/** 列出思源所有笔记本 */
+/** 列出思源所有笔记本（设置页用） */
 export async function listNotebooks(): Promise<Array<{ id: string; name: string }>> {
     try {
         const resp: any = await fetchSyncPost("/api/notebook/lsNotebooks", {});
@@ -149,90 +78,284 @@ export async function listNotebooks(): Promise<Array<{ id: string; name: string 
     }
 }
 
+// === Markdown 组装（与官方扩展 background.js 保持一致）===
+
+/** 官方扩展默认剪藏模板 */
+export const CLIP_DEFAULT_TEMPLATE =
+    "---\n\n" +
+    '- ${title}${siteName ? " - " + siteName : ""}\n' +
+    "- [${urlDecoded}](${url}) \n" +
+    '${excerpt ? "- " + excerpt : ""}\n' +
+    "- ${date} ${time}\n" +
+    "\n---\n\n" +
+    "${content}";
+
+function formatClipExcerpt(excerpt: string): string {
+    let text = (excerpt || "").trim();
+    if (text === "") return "";
+    text = text.replace(/\n{3,}/g, "\n\n");
+    // 从第二行开始，每行前面加两个空格
+    text = text.replace(/\n/g, "\n  ");
+    return text.trim();
+}
+
+function decodeClipUrl(href: string): string {
+    try {
+        return decodeURIComponent(href);
+    } catch {
+        return href;
+    }
+}
+
+function getClipDateTime(): string {
+    const now = new Date();
+    const p = (n: number) => (n < 10 ? "0" + n : "" + n);
+    return (
+        now.getFullYear() + "-" + p(now.getMonth() + 1) + "-" + p(now.getDate()) +
+        " " + p(now.getHours()) + ":" + p(now.getMinutes()) + ":" + p(now.getSeconds())
+    );
+}
+
+function getClipSimpleDateTime(): { date: string; time: string } {
+    const now = new Date();
+    return { date: now.toISOString().slice(0, 10), time: now.toTimeString().slice(0, 5) };
+}
+
+/** 模板渲染（支持 ${var} 与 ${cond ? "a" : b} 条件表达式） */
+function renderClipTemplate(template: string, data: Record<string, any>): string {
+    return template.replace(/\$\{([^}]+)\}/g, (_match, key: string) => {
+        const conditionalMatch = key.match(/(.+?)\s*\?\s*(.*?)\s*:\s*(.*)/);
+        if (conditionalMatch) {
+            const conditionKey = conditionalMatch[1].trim();
+            const trueValueString = conditionalMatch[2].trim();
+            const falseValueString = conditionalMatch[3].trim();
+            const condition = conditionKey.split(".").reduce((obj: any, prop) => obj && obj[prop], data);
+            const getValue = (valueStr: string): string => {
+                if (
+                    (valueStr.startsWith("'") && valueStr.endsWith("'")) ||
+                    (valueStr.startsWith('"') && valueStr.endsWith('"'))
+                ) {
+                    return valueStr.slice(1, -1);
+                }
+                const parts = valueStr.split("+").map((part) => part.trim());
+                let result = "";
+                for (const part of parts) {
+                    if ((part.startsWith("'") && part.endsWith("'")) || (part.startsWith('"') && part.endsWith('"'))) {
+                        result += part.slice(1, -1);
+                    } else {
+                        const variableValue = part.split(".").reduce((obj: any, prop) => obj && obj[prop], data);
+                        result += variableValue !== undefined ? variableValue : "";
+                    }
+                }
+                return result;
+            };
+            return condition ? getValue(trueValueString) : getValue(falseValueString);
+        }
+        const value = key.split(".").reduce((obj: any, prop) => obj && obj[prop], data);
+        return value !== undefined ? value : "";
+    });
+}
+
+/** 模板渲染失败时的默认格式 */
+function getDefaultClipMarkdown(p: ClipPayload, contentMd: string): string {
+    let markdown = "---\n\n* " + (p.title || "Untitled");
+    const siteName = p.siteName || "";
+    if ("" !== siteName) {
+        markdown += " - " + siteName;
+    }
+    markdown += "\n";
+    markdown += "* " + "[" + decodeClipUrl(p.href) + "](" + p.href + ")\n";
+    const excerpt = formatClipExcerpt(p.excerpt);
+    if ("" !== excerpt) {
+        markdown += "* " + excerpt + "\n";
+    } else {
+        markdown += "\n";
+    }
+    markdown += "* " + getClipDateTime() + "\n\n---\n\n" + contentMd;
+    return markdown;
+}
+
+function buildClipMarkdown(p: ClipPayload, contentMd: string): string {
+    const excerpt = formatClipExcerpt(p.excerpt);
+    const { date, time } = getClipSimpleDateTime();
+    const templateData = {
+        title: p.title || "Untitled",
+        siteName: p.siteName || "",
+        excerpt: excerpt || "",
+        url: p.href,
+        urlDecoded: decodeClipUrl(p.href),
+        date,
+        time,
+        tags: "",
+        content: contentMd,
+    };
+    try {
+        return renderClipTemplate(CLIP_DEFAULT_TEMPLATE, templateData);
+    } catch (e) {
+        console.error("[browser-plugin] template rendering error:", e);
+        return getDefaultClipMarkdown(p, contentMd);
+    }
+}
+
+/** 规范化文档保存路径（与官方扩展 normalizeClipDocumentPath 一致） */
+function normalizeClipDocumentPath(parentPath: string, title: string): string {
+    let path = String(parentPath || "").trim().split("\\").join("/");
+    path = path.replace(/\/{2,}/g, "/");
+    if (!path.startsWith("/")) path = "/" + path;
+    if (path.length > 1) path = path.replace(/\/+$/, "");
+    return (path === "/" ? "" : path) + "/" + title;
+}
+
+/** sprig 模板路径渲染 */
+async function renderSprigPath(template: string): Promise<string | null> {
+    try {
+        const resp: any = await fetchSyncPost("/api/template/renderSprig", { template });
+        if (resp?.code === 0 && typeof resp.data === "string") {
+            return resp.data;
+        }
+        console.warn("[browser-plugin] renderSprig failed:", resp);
+        return null;
+    } catch {
+        return null;
+    }
+}
+
+function dataUrlToBlob(dataUrl: string): Promise<Blob> {
+    return fetch(dataUrl).then((r) => r.blob());
+}
+
 /**
- * 在思源指定笔记本下创建新文档，写入网页摘录内容。
- * 文档标题为网页标题，内容为正文 Markdown + 来源链接。
+ * 执行剪藏：从 webview 收集内容并保存到思源。
+ * - article：整页摘录（Readability），创建新文档
+ * - part：选区摘录，Markdown 复制到剪贴板
  */
-export async function excerptToSiYuan(
+export async function clipToSiYuan(
     webview: any,
-    notebookId: string,
+    opts: ClipOptions,
     i18n: Record<string, string>
 ): Promise<void> {
-    if (!notebookId) {
-        showMessage(i18n.excerptFailed + ": " + (i18n.excerptNotebook || "notebook") + " ?", 3000, "error");
-        return;
+    if (opts.mode === "article") {
+        if (!opts.notebookId) {
+            showMessage(i18n.excerptNotebookRequired || (i18n.excerptFailed + ": " + (i18n.excerptNotebook || "notebook") + " ?"), 3000, "error");
+            return;
+        }
+        // 校验笔记本仍存在且处于打开状态：设置里保存的 ID 可能因笔记本被删除/关闭/换工作空间而失效，
+        // 直接调 createDocWithMd 内核只会报"查询笔记本失败"，用户无从下手
+        const notebooks = await listNotebooks();
+        if (!notebooks.some((n) => n.id === opts.notebookId)) {
+            showMessage(i18n.excerptNotebookInvalid || "保存笔记本不存在或已关闭，请到设置中重新选择", 5000, "error");
+            return;
+        }
     }
 
     showMessage(i18n.excerpt + "...", 2000, "info");
 
-    const extracted = await extractPageContent(webview);
-    if (!extracted) {
-        showMessage(i18n.excerptFailed + ": extract failed", 3000, "error");
+    let payload: ClipPayload;
+    try {
+        payload = await runClipScript(webview, opts);
+    } catch (e: any) {
+        console.error("[browser-plugin] runClipScript failed:", e);
+        showMessage(i18n.excerptFailed + ": " + (e?.message || e), 4000, "error");
         return;
     }
-    if (!extracted.content) {
+    if (!payload?.ok) {
+        const reason = payload?.error === "no_selection" ? (i18n.excerptNoSelection || "no selection")
+            : payload?.error === "readability_failed" ? (i18n.excerptReadabilityFailed || "readability failed")
+            : (payload?.error || "extract failed");
+        showMessage(i18n.excerptFailed + ": " + reason, 4000, "error");
+        return;
+    }
+    if (!payload.dom) {
         showMessage(i18n.excerptFailed + ": content empty", 3000, "error");
         return;
     }
 
-    // 组装 Markdown：来源信息放文章开头 + 正文
-    const dateStr = new Date().toLocaleString();
-    const md = [
-        "> " + (i18n.excerpt || "Excerpt") + " - " + dateStr,
-        "> URL: [" + extracted.url + "](" + extracted.url + ")",
-        "",
-        "---",
-        "",
-        extracted.content,
-    ].join("\n");
+    // 1. 调用内核 /api/extension/copy：lute 转 Markdown + 下载资源
+    let md = "";
+    let withMath: boolean | undefined;
+    try {
+        const form = new FormData();
+        form.append("dom", payload.dom);
+        for (const key of Object.keys(payload.files || {})) {
+            const f = payload.files[key];
+            form.append(key, await dataUrlToBlob(f.data));
+        }
+        form.append("notebook", opts.notebookId || "");
+        form.append("href", payload.href);
+        form.append("tags", opts.tags || "");
+        form.append("clipType", opts.mode);
+        form.append("assets", String(opts.assets));
 
-    // 清理标题：移除思源文件名不允许的字符，避免"文件名重复"
-    // 思源文件名不允许 / \ : * ? " < > |，且会因这些字符生成相同的非法文件名
-    const cleanTitle = (extracted.title || "Untitled")
-        .replace(/[\/\\:*?"<>|]/g, " ")
-        .replace(/\s+/g, " ")
-        .trim()
-        .slice(0, 100) || "Untitled";
+        const resp = await fetch("/api/extension/copy", { method: "POST", body: form });
+        const copyResult = await resp.json();
+        if (copyResult.code < 0) {
+            showMessage(i18n.excerptFailed + ": " + copyResult.msg, 4000, "error");
+            return;
+        }
+        md = copyResult.data?.md || "";
+        withMath = copyResult.data?.withMath;
+    } catch (e: any) {
+        console.error("[browser-plugin] /api/extension/copy failed:", e);
+        showMessage(i18n.excerptFailed + ": " + (e?.message || e), 4000, "error");
+        return;
+    }
 
-    console.log("[browser-plugin] excerptToSiYuan creating doc:", {
-        notebookId,
-        cleanTitle,
-        mdLen: md.length,
-        mdPreview: md.slice(0, 200),
-    });
+    // 2. 选区剪藏：复制 Markdown 到剪贴板（与官方扩展一致）
+    if (opts.mode === "part") {
+        const { copyText } = await import("../utils/dom");
+        await copyText(md);
+        showMessage(i18n.excerptComplete + " → " + (i18n.clipboard || "clipboard"), 3000, "info");
+        return;
+    }
+
+    if (!md) {
+        showMessage(i18n.excerptFailed + ": empty markdown", 3000, "error");
+        return;
+    }
+
+    // 3. 组装 Markdown 并创建文档
+    const title = (payload.title ? payload.title : "Untitled").replace(/[\\/]/g, "／") || "Untitled";
+    const markdown = buildClipMarkdown(payload, md);
+
+    let parentPath = opts.parentPath || "/";
+    if (parentPath.includes("{{")) {
+        const rendered = await renderSprigPath(parentPath);
+        if (rendered == null) {
+            showMessage(i18n.excerptFailed + ": renderSprig", 4000, "error");
+            return;
+        }
+        parentPath = rendered;
+    }
+    const path = normalizeClipDocumentPath(parentPath, title);
 
     try {
-        // 使用 createDocWithMd API 创建文档
-        // 参数：notebook（笔记本ID）、path（文档路径，如 /标题，不含笔记本ID）、markdown（内容）
-        // 注意：path 是 hpath（人类可读路径），不是笔记本ID开头的路径
-        const baseTitle = cleanTitle;
-        let attempt = 0;
-        let resp: any;
-        while (true) {
-            const tryTitle = attempt === 0 ? baseTitle : `${baseTitle} (${attempt})`;
-            const fullPath = "/" + tryTitle;
-            resp = await fetchSyncPost("/api/filetree/createDocWithMd", {
-                notebook: notebookId,
-                path: fullPath,
-                markdown: md,
-            });
-            console.log(`[browser-plugin] createDocWithMd attempt ${attempt}, path: ${fullPath}, resp:`, resp);
-            if (resp?.code === 0) {
-                showMessage(i18n.excerptComplete + ": " + tryTitle, 3000, "info");
-                return;
-            }
-            // 文件名重复 → 换标题重试
-            if (resp?.msg === "文件名重复" || resp?.msg?.includes("重复")) {
-                attempt++;
-                if (attempt > 50) break;
-                continue;
-            }
-            break; // 其他错误不再重试
+        const resp: any = await fetchSyncPost("/api/filetree/createDocWithMd", {
+            notebook: opts.notebookId,
+            parentID: "",
+            tags: opts.tags || "",
+            path,
+            markdown,
+            withMath,
+            clippingHref: payload.href,
+            listDocTree: false,
+        });
+        if (resp?.code !== 0) {
+            showMessage(i18n.excerptFailed + ": " + (resp?.msg || "unknown"), 4000, "error");
+            return;
         }
-        console.error("[browser-plugin] createDoc failed:", resp);
-        showMessage(i18n.excerptFailed + ": " + (resp?.msg || "unknown"), 4000, "error");
+        const docId = resp.data;
+        showMessage(i18n.excerptComplete + ": " + title, 3000, "info");
+
+        // 4. 图片抓取失败 → 内核网络图片转本地兜底
+        if (payload.fetchFileErr && docId) {
+            fetch("/api/format/netImg2LocalAssets", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ id: docId, url: payload.href }),
+            }).catch(() => {});
+        }
     } catch (e: any) {
-        console.error("[browser-plugin] excerptToSiYuan failed:", e);
+        console.error("[browser-plugin] createDoc failed:", e);
         showMessage(i18n.excerptFailed + ": " + (e?.message || e), 4000, "error");
     }
 }

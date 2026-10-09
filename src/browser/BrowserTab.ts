@@ -8,7 +8,9 @@ import type { HistoryStore } from "../storage/historyStore";
 import type { BookmarksStore } from "../storage/bookmarksStore";
 import type { SettingsStore } from "../storage/settingsStore";
 import { SettingsDialog } from "../settings/SettingsDialog";
-import { excerptToSiYuan } from "./excerpt";
+import { clipToSiYuan } from "./excerpt";
+import { BROWSER_PARTITION } from "../constants";
+import { remoteSession } from "../utils/electron";
 
 /** 浏览器页签实例依赖 */
 export interface BrowserTabDeps {
@@ -23,6 +25,8 @@ export interface BrowserTabDeps {
     onTabTitleChange: (title: string) => void;
     /** 通知页签图标更新 */
     onTabIconChange: (icon: string) => void;
+    /** Chrome 扩展内容脚本注入（每次 webview 页面 dom-ready 时调用） */
+    injectExtensions?: (webview: IWebviewTag, url: string) => void;
 }
 
 /**
@@ -37,6 +41,12 @@ export class BrowserTab {
     private deps: BrowserTabDeps;
     private settings: BrowserSettings;
     private disposed = false;
+    /** webview 重建中标记（防止重复重建） */
+    private rebuilding = false;
+    /** webview 健康监测定时器 */
+    private healthTimer: any = null;
+    /** 连续健康检查失败计数（连续 2 次才判定损坏） */
+    private healthFailCount = 0;
 
     constructor(deps: BrowserTabDeps, initialUrl?: string) {
         this.deps = deps;
@@ -86,9 +96,23 @@ export class BrowserTab {
                 onFindResult: (active, total) => {
                     this.toolbar.setFindResult(active, total);
                 },
-                onExcerpt: () => {
-                    const nb = this.settings.excerptNotebook || "";
-                    excerptToSiYuan(this.webview, nb, this.deps.i18n);
+                onExcerpt: (mode: "article" | "part") => {
+                    const s = this.settings;
+                    clipToSiYuan(this.webview, {
+                        mode: mode || "article",
+                        notebookId: s.excerptNotebook || "",
+                        parentPath: s.excerptParentPath || "/",
+                        tags: s.excerptTags || "",
+                        assets: s.excerptAssets !== false,
+                        exp: {
+                            bold: !!s.excerptExpBold,
+                            italic: !!s.excerptExpItalic,
+                            underline: !!s.excerptExpUnderline,
+                            removeImgLink: !!s.excerptExpRemoveImgLink,
+                            span: !!s.excerptExpSpan,
+                            svgToImg: !!s.excerptExpSvgToImg,
+                        },
+                    }, this.deps.i18n);
                 },
             },
         });
@@ -120,6 +144,15 @@ export class BrowserTab {
 
         this.controller.attach();
 
+        // Chrome 扩展内容脚本注入（每次页面导航完成后由 dom-ready 触发）
+        if (deps.injectExtensions) {
+            this.controller.onDomReady = (wv, url) => deps.injectExtensions!(wv, url);
+        }
+
+        // 启动 webview 健康监测：思源分屏/拖动页签会搬移 panelElement，
+        // Electron webview 被重新挂载后 guest 即损坏（白屏且无响应），需自动重建
+        this.startHealthMonitor();
+
         // 异步初始化：先确保 preload 路径就绪，再加载初始 URL
         // preload 必须在 webview 第一次加载前设置，否则不生效
         this.init(initialUrl);
@@ -138,29 +171,25 @@ export class BrowserTab {
      */
     private stripSiteSecurityHeaders(): void {
         try {
-            // 从渲染进程获取 Electron session（思源渲染进程支持 require）
-            const electron = (window as any).require?.("electron") || (globalThis as any).require?.("electron");
-            if (!electron?.session) {
-                console.warn("[browser-plugin] electron.session unavailable, trying webview session");
-                // 回退：通过 webview.getWebContents() 获取
-                const wv: any = this.webview;
-                const contents = wv.getWebContents?.();
-                const session = contents?.session;
-                if (session?.webRequest) {
-                    this.registerWebRequest(session);
-                } else {
-                    console.warn("[browser-plugin] no session available for webRequest");
-                }
-                return;
-            }
-            const session = electron.session.fromPartition("persist:siyuan-browser");
+            // 首选：@electron/remote 获取主进程 session（最可靠）；
+            // 降级：webview.getWebContents()（Electron 新版本可能移除）
+            const session = remoteSession(BROWSER_PARTITION) || this.webviewSessionFallback();
             if (!session?.webRequest) {
-                console.warn("[browser-plugin] session.fromPartition returned no webRequest");
+                console.warn("[browser-plugin] no session available for webRequest");
                 return;
             }
             this.registerWebRequest(session);
         } catch (e) {
             console.warn("[browser-plugin] stripSiteSecurityHeaders failed:", e);
+        }
+    }
+
+    private webviewSessionFallback(): any | null {
+        try {
+            const wv: any = this.webview;
+            return wv?.getWebContents?.()?.session || null;
+        } catch {
+            return null;
         }
     }
 
@@ -263,24 +292,92 @@ export class BrowserTab {
 
     private buildDom(): HTMLElement {
         const root = el("div", "sy-browser-tab");
+        const content = el("div", "sy-browser-content");
+        content.appendChild(this.createWebviewElement() as unknown as HTMLElement);
+        root.appendChild(content);
+        return root;
+    }
+
+    /**
+     * 创建 webview 元素。
+     * webpreferences: 允许 preload 中 require('electron')（contextIsolation 关闭）
+     *   允许 sub-frame nodeIntegration（preload 注入子框架）
+     *   允许加载本地文件（webSecurity 不关闭，避免破坏站点 CSS/CSP）
+     * 分屏/拖动导致 webview 损坏时，重建也走这里保证属性一致。
+     */
+    private createWebviewElement(): IWebviewTag {
+        const webview = document.createElement("webview") as unknown as IWebviewTag;
+        webview.setAttribute("src", "about:blank");
+        webview.setAttribute("allowpopups", "");
+        webview.setAttribute("partition", BROWSER_PARTITION);
+        webview.setAttribute("webpreferences", "contextIsolation=no,nodeIntegrationInSubFrames=yes");
         // 在构建 webview 时立即设置 preload（若路径已缓存），确保首次加载就生效
-        // webpreferences: 允许 preload 中 require('electron')（contextIsolation 关闭）
-        //   允许 sub-frame nodeIntegration（preload 注入子框架）
-        //   允许加载本地文件（webSecurity 不关闭，避免破坏站点 CSS/CSP）
-        let preloadAttr = "";
         try {
             const plugin = (window as any).browserPlugin as any;
             const cached = plugin?.getPreloadPathSync?.();
             if (cached && this.settings.enablePreload) {
-                preloadAttr = ` preload="${cached}"`;
+                webview.setAttribute("preload", cached);
             }
         } catch {}
-        root.innerHTML = `
-            <div class="sy-browser-content">
-                <webview src="about:blank" allowpopups="" partition="persist:siyuan-browser" webpreferences="contextIsolation=no,nodeIntegrationInSubFrames=yes"${preloadAttr} style="flex:1;width:100%;border:0;"></webview>
-            </div>
-        `;
-        return root;
+        (webview as unknown as HTMLElement).style.cssText = "flex:1;width:100%;border:0;";
+        return webview;
+    }
+
+    /** 启动 webview 健康监测（损坏自动重建） */
+    private startHealthMonitor(): void {
+        if (this.healthTimer) return;
+        this.healthTimer = setInterval(async () => {
+            if (this.disposed || this.rebuilding) return;
+            // 首次加载完成前、以及任何导航进行中都不探测：
+            // 加载期间页面主线程繁忙/进程切换会让 executeJavaScript 探测超时，
+            // 新页签初始 src 是 about:blank，此时误判重建会让页签永远停在空白页
+            if (!this.controller.hasCompletedInitialLoad() || this.controller.isLoading()) return;
+            try {
+                const healthy = await this.controller.isHealthy();
+                if (!healthy && !this.disposed && !this.rebuilding) {
+                    // 连续两次失败才判定损坏，避免偶发超时误判
+                    this.healthFailCount++;
+                    if (this.healthFailCount >= 2) {
+                        this.healthFailCount = 0;
+                        console.warn("[browser-plugin] webview broken (moved in DOM?), rebuilding");
+                        await this.rebuildWebview();
+                    }
+                } else {
+                    this.healthFailCount = 0;
+                }
+            } catch {}
+        }, 2000);
+    }
+
+    /**
+     * 重建 webview：新建同属性元素替换旧元素，重新挂载控制器并恢复当前 URL。
+     * 用于分屏/页签搬移等 DOM 重新挂载导致 webview guest 损坏的场景。
+     */
+    private async rebuildWebview(): Promise<void> {
+        if (this.disposed || this.rebuilding) return;
+        this.rebuilding = true;
+        try {
+            const savedUrl = this.controller.getCurrentUrl();
+            const container = this.element.querySelector(".sy-browser-content");
+            if (!container) return;
+            const newWebview = this.createWebviewElement();
+            if (this.settings.userAgent) {
+                newWebview.useragent = this.settings.userAgent;
+            }
+            this.webview.replaceWith(newWebview);
+            this.webview = newWebview;
+            this.controller.reattach(newWebview);
+            // getCurrentUrl 会优先返回已知 URL（加载未提交时 getURL 是 about:blank），
+            // 这里无条件恢复，避免重建后停留在空白页
+            if (savedUrl) {
+                await this.controller.loadURL(savedUrl);
+            }
+            console.log("[browser-plugin] webview rebuilt, url:", savedUrl);
+        } catch (e) {
+            console.error("[browser-plugin] rebuildWebview failed:", e);
+        } finally {
+            this.rebuilding = false;
+        }
     }
 
     private async onToolbarAction(action: string, payload?: any): Promise<void> {
@@ -366,7 +463,12 @@ export class BrowserTab {
                 label: this.deps.i18n.settings,
                 click: () => {
                     try {
-                        new SettingsDialog(this.deps.settings, this.deps.i18n).open();
+                        const dlg = new SettingsDialog(this.deps.settings, this.deps.i18n);
+                        dlg.extensionOpener = () => {
+                            const plugin = (window as any).browserPlugin as any;
+                            plugin?.extensionHost?.openManager(this.deps.i18n);
+                        };
+                        dlg.open();
                     } catch (e) {
                         console.error("[browser-plugin] open settings dialog failed:", e);
                     }
@@ -443,6 +545,10 @@ export class BrowserTab {
     dispose(): void {
         if (this.disposed) return;
         this.disposed = true;
+        if (this.healthTimer) {
+            clearInterval(this.healthTimer);
+            this.healthTimer = null;
+        }
         this.controller.dispose();
         this.element.remove();
     }

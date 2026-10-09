@@ -21,6 +21,9 @@ export class BookmarksStore {
         } catch {
             this.items = [];
         }
+        // Dock 面板在布局构建期（早于 onLayoutReady）就已 init 并订阅，
+        // 数据此时才到达，必须通知刷新，否则面板一直显示空白
+        this.notify();
     }
 
     /** 旧格式书签迁移为标签格式 */

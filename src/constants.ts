@@ -33,12 +33,25 @@ export const DEFAULT_SETTINGS: BrowserSettings = {
     userAgent: "",
     enablePreload: true,
     excerptNotebook: "",
+    excerptParentPath: "/",
+    excerptTags: "",
+    excerptAssets: true,
+    excerptExpBold: false,
+    excerptExpItalic: false,
+    excerptExpUnderline: false,
+    excerptExpRemoveImgLink: false,
+    excerptExpSpan: false,
+    excerptExpSvgToImg: false,
     interceptAllLinks: false,
     excludedSites: "github.com",
+    adBlockEnabled: true,
+    adBlockRules: "",
 };
 
 /** 历史上限硬上限 */
 export const HISTORY_HARD_LIMIT = 50000;
+/** 浏览器页签 webview 的专用 session partition（扩展加载/session API 共用） */
+export const BROWSER_PARTITION = "persist:siyuan-browser";
 
 /** 下载并发数 */
 export const MAX_CONCURRENT_DOWNLOADS = 3;

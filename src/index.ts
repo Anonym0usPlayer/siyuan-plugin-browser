@@ -18,8 +18,11 @@ import { HistoryDock } from "./docks/HistoryDock";
 import { DownloadsDock } from "./docks/DownloadsDock";
 import { SettingsDialog } from "./settings/SettingsDialog";
 import { registerShortcuts } from "./commands/shortcuts";
+import { ExtensionHost } from "./extensions/extensionHost";
 import { getFilenameFromUrl, isUrlExcluded } from "./utils/url";
 import { uid } from "./utils/dom";
+import { buildAdBlockCss } from "./browser/adblock";
+import BUILTIN_ADBLOCK_RULES from "./assets/adblock-rules.txt";
 import "./index.scss";
 
 /**
@@ -37,6 +40,8 @@ export default class BrowserPlugin extends Plugin {
     historyStore!: HistoryStore;
     downloadsStore!: DownloadsStore;
     settingsStore!: SettingsStore;
+    /** Chrome 扩展宿主（content script 注入） */
+    extensionHost!: ExtensionHost;
     /** 浏览器页签实例表：tabId → BrowserTab */
     private tabInstances: Map<string, BrowserTab> = new Map();
     /** Dock 实例引用（用于动态打开） */
@@ -47,14 +52,20 @@ export default class BrowserPlugin extends Plugin {
     /** 全局链接拦截器引用（用于启用/禁用时添加/移除） */
     private globalLinkHandler: ((e: MouseEvent) => void) | null = null;
     /** 原始 window.open 引用（用于恢复） */
-    private originalWindowOpen: ((url?: string, target?: string, features?: string) => Window | null) | null = null;
+    private originalWindowOpen: typeof window.open | null = null;
 
     onload(): void {
+        // 全局引用必须在 onload 最早建立：Dock/页签的 init() 在布局构建期执行，
+        // 早于 onLayoutReady；若等到 onLayoutReady 才赋值，Dock init 时拿到 undefined
+        // 会抛异常，面板一片空白（直到拖动 dock 图标触发重建才恢复）。
+        (window as any).browserPlugin = this;
+
         // 初始化 stores
         this.bookmarksStore = new BookmarksStore(this);
         this.historyStore = new HistoryStore(this);
         this.downloadsStore = new DownloadsStore(this);
         this.settingsStore = new SettingsStore(this);
+        this.extensionHost = new ExtensionHost(this);
 
         // 注册自定义页签类型
         this.addTab({
@@ -105,10 +116,27 @@ export default class BrowserPlugin extends Plugin {
                                 console.warn("[browser-plugin] set tab icon failed:", e);
                             }
                         },
+                        injectExtensions: (webview, url) => {
+                            try {
+                                // 注意：此箭头函数位于 addTab init() 作用域内，this 是页签对象，
+                                // 必须用 plugin 引用（window.browserPlugin）而非 this
+                                plugin.injectAdFilter(webview, url);
+                            } catch (e) {
+                                console.warn("[browser-plugin] ad filter inject failed:", e);
+                            }
+                            try {
+                                plugin.extensionHost?.inject(webview, url);
+                            } catch (e) {
+                                console.warn("[browser-plugin] inject extensions failed:", e);
+                            }
+                        },
                     },
                     data.url
                 );
-                plugin.tabInstances.set((this as any).id || uid(), tab);
+                // 注意：Custom（Model 基类）没有 id 字段，页签 id 在 this.tab.id 上。
+                // 之前用 (this as any).id（undefined）落到 uid() 随机 key，
+                // 导致 getActiveBrowserTab() 永远查不到实例、"替换当前页"等行为失效。
+                plugin.tabInstances.set((this as any).tab?.id || uid(), tab);
                 this.element.appendChild(tab.element);
                 // 移除默认的 iconBrowser SVG（即使 icon 未设置，思源也可能生成占位）
                 try {
@@ -118,8 +146,17 @@ export default class BrowserPlugin extends Plugin {
             },
             destroy(): void {
                 const plugin = (window as any).browserPlugin as BrowserPlugin;
+                if (!plugin) return;
+                // 优先按页签 id 精确销毁对应实例
+                const key = (this as any).tab?.id;
+                if (key && plugin.tabInstances.has(key)) {
+                    const v = plugin.tabInstances.get(key)!;
+                    v.dispose();
+                    plugin.tabInstances.delete(key);
+                }
+                // 兜底：清理已脱离文档的实例（布局搬移期间的残留）
                 for (const [k, v] of plugin.tabInstances) {
-                    if (v.element.isConnected === false || v.element === (this as any).element?.firstChild) {
+                    if (v.element.isConnected === false) {
                         v.dispose();
                         plugin.tabInstances.delete(k);
                     }
@@ -128,11 +165,12 @@ export default class BrowserPlugin extends Plugin {
         });
 
         // 注册 Dock：书签
+        // 图标用 iconStar（浏览器书签的星星样式）：iconBookmark 与思源原生书签面板图标重复
         this.addDock({
             config: {
                 position: "LeftBottom",
                 size: { width: 240, height: 0 },
-                icon: "iconBookmark",
+                icon: "iconStar",
                 title: this.i18n.bookmarks,
                 hotkey: "⌥⌘B",
             },
@@ -140,6 +178,7 @@ export default class BrowserPlugin extends Plugin {
             type: DOCK_BOOKMARKS,
             init() {
                 const plugin = (window as any).browserPlugin as BrowserPlugin;
+                if (!plugin?.bookmarksStore) return;
                 const dock = new BookmarksDock(plugin.bookmarksStore, plugin.i18n, (url) => plugin.openUrl(url));
                 dock.init();
                 plugin.dockInstances.set(DOCK_BOOKMARKS, dock);
@@ -168,6 +207,7 @@ export default class BrowserPlugin extends Plugin {
             type: DOCK_HISTORY,
             init() {
                 const plugin = (window as any).browserPlugin as BrowserPlugin;
+                if (!plugin?.historyStore) return;
                 const dock = new HistoryDock(plugin.historyStore, plugin.i18n, (url) => plugin.openUrl(url));
                 dock.init();
                 plugin.dockInstances.set(DOCK_HISTORY, dock);
@@ -196,6 +236,7 @@ export default class BrowserPlugin extends Plugin {
             type: DOCK_DOWNLOADS,
             init() {
                 const plugin = (window as any).browserPlugin as BrowserPlugin;
+                if (!plugin?.downloadsStore) return;
                 const dock = new DownloadsDock(
                     plugin.downloadsStore,
                     plugin.i18n,
@@ -264,6 +305,17 @@ export default class BrowserPlugin extends Plugin {
         });
     }
 
+    /** 内置广告过滤：dom-ready 时按当前 URL 命中的规则注入隐藏 CSS（动态插入的广告节点同样生效） */
+    injectAdFilter(webview: IWebviewTag, url: string): void {
+        const s = this.settingsStore.get();
+        if (!s.adBlockEnabled) return;
+        const css = buildAdBlockCss(url, s.adBlockRules || "", BUILTIN_ADBLOCK_RULES);
+        if (!css) return;
+        Promise.resolve((webview as any).insertCSS(css)).catch((e) => {
+            console.warn("[browser-plugin] ad filter insertCSS failed:", e);
+        });
+    }
+
     /**
      * 全局链接拦截器：当 interceptAllLinks=true 时，
      * 拦截思源内所有 http(s) 链接点击，用浏览器插件打开而非系统浏览器。
@@ -283,16 +335,17 @@ export default class BrowserPlugin extends Plugin {
         if (enabled && !this.globalLinkHandler) {
             // 1. Monkey-patch window.open：按 target 参数决定开新标签还是替换当前页
             this.originalWindowOpen = window.open.bind(window);
-            window.open = (url?: string, target?: string, features?: string): Window | null => {
-                if (url && /^https?:\/\//i.test(url)) {
+            window.open = (url?: string | URL, target?: string, features?: string): Window | null => {
+                const urlStr = url == null ? "" : String(url);
+                if (urlStr && /^https?:\/\//i.test(urlStr)) {
                     // 排除网站：不拦截，回退到原始 window.open（触发思源系统浏览器打开）
-                    if (this.isUrlExcluded(url)) {
-                        return this.originalWindowOpen!(url, target, features);
+                    if (this.isUrlExcluded(urlStr)) {
+                        return this.originalWindowOpen!(urlStr, target, features);
                     }
                     const newTab = target === "_blank" || !this.getActiveBrowserTab();
-                    console.log("[browser-plugin] window.open intercept:", url, "newTab:", newTab);
-                    if (newTab) this.openUrl(url);
-                    else this.openUrlInCurrent(url);
+                    console.log("[browser-plugin] window.open intercept:", urlStr, "newTab:", newTab);
+                    if (newTab) this.openUrl(urlStr);
+                    else this.openUrlInCurrent(urlStr);
                     return null;
                 }
                 return this.originalWindowOpen!(url, target, features);
@@ -572,11 +625,77 @@ export default class BrowserPlugin extends Plugin {
                             if (nb.id === s.excerptNotebook) opt.selected = true;
                             sel.appendChild(opt);
                         }
+                        // 已保存的笔记本 ID 失效（被删除/关闭）时显式标注，提示重新选择
+                        if (s.excerptNotebook && !notebooks.some((nb) => nb.id === s.excerptNotebook)) {
+                            const stale = document.createElement("option");
+                            stale.value = s.excerptNotebook;
+                            stale.textContent = this.i18n.excerptNotebookStale || "(已失效，请重新选择)";
+                            stale.selected = true;
+                            sel.appendChild(stale);
+                        }
                     } catch (e) {
                         console.warn("[browser-plugin] load notebooks failed:", e);
                     }
                 })();
                 return sel;
+            },
+        });
+
+        // 摘录保存路径（hpath，支持 sprig 模板）
+        setting.addItem({
+            title: this.i18n.excerptParentPath || "摘录保存路径",
+            direction: "row",
+            description: "整页摘录保存到该路径下，如 /剪藏 或 /collections/web。支持 {{...}} sprig 模板。",
+            createActionElement: () => makeInput("excerptParentPath", s.excerptParentPath || "/", { placeholder: "/" }),
+        });
+
+        // 摘录标签
+        setting.addItem({
+            title: this.i18n.excerptTags || "摘录标签",
+            direction: "row",
+            description: "为摘录文档添加标签，逗号分隔。",
+            createActionElement: () => makeInput("excerptTags", s.excerptTags || "", { placeholder: "web, clip" }),
+        });
+
+        // 摘录下载资源
+        setting.addItem({
+            title: this.i18n.excerptAssets || "摘录下载资源",
+            direction: "row",
+            description: "摘录时把网页图片下载到思源资源库（失败时由内核兜底转换）。",
+            createActionElement: () => makeCheckbox("excerptAssets", s.excerptAssets !== false),
+        });
+
+        // 摘录前处理选项（与官方扩展 exp 选项一致，默认关闭）
+        const expOptions: Array<[keyof BrowserSettings, string]> = [
+            ["excerptExpBold", "粗体样式转 <b>"],
+            ["excerptExpItalic", "斜体样式转 <i>"],
+            ["excerptExpUnderline", "下划线样式转 <u>"],
+            ["excerptExpRemoveImgLink", "移除图片外层链接"],
+            ["excerptExpSpan", "span 换行转 <br>"],
+            ["excerptExpSvgToImg", "内嵌 SVG 转图片"],
+        ];
+        for (const [key, desc] of expOptions) {
+            setting.addItem({
+                title: this.i18n.excerptExp || "摘录前处理",
+                direction: "row",
+                description: desc + "（与官方剪藏扩展高级选项一致，默认关闭）",
+                createActionElement: () => makeCheckbox(key, (s as any)[key] === true),
+            });
+        }
+
+        // Chrome 扩展管理
+        setting.addItem({
+            title: this.i18n.extManager || "Chrome 扩展",
+            direction: "row",
+            description: "安装未打包扩展目录或 CRX / ZIP 扩展包，内容脚本会注入到浏览器页签中的网页。",
+            createActionElement: () => {
+                const btn = document.createElement("button");
+                btn.className = "b3-button";
+                btn.textContent = this.i18n.extManageOpen || "管理扩展...";
+                btn.addEventListener("click", () => {
+                    this.extensionHost.openManager(this.i18n);
+                });
+                return btn;
             },
         });
 
@@ -608,6 +727,34 @@ export default class BrowserPlugin extends Plugin {
             },
         });
 
+        // 广告过滤开关
+        setting.addItem({
+            title: this.i18n.adBlockEnabled || "广告过滤",
+            direction: "row",
+            description: "元素隐藏（注入 CSS），不做网络拦截。修改后刷新页签生效。",
+            createActionElement: () => makeCheckbox("adBlockEnabled", s.adBlockEnabled !== false),
+        });
+
+        // 自定义广告规则
+        setting.addItem({
+            title: this.i18n.adBlockRules || "自定义广告规则",
+            direction: "row",
+            description: this.i18n.adBlockRulesDesc,
+            createActionElement: () => {
+                const ta = document.createElement("textarea");
+                ta.className = "b3-text-field";
+                ta.rows = 5;
+                ta.style.width = "100%";
+                ta.style.resize = "vertical";
+                ta.style.fontFamily = "monospace";
+                ta.style.minWidth = "240px";
+                ta.value = s.adBlockRules || "";
+                ta.placeholder = "tgb.cn###tcAd\nexample.com##.ad-banner\n##iframe[src*=\"pos.baidu.com\"]\nexample.com#@#.keep-me";
+                refs.adBlockRules = ta as unknown as HTMLInputElement;
+                return ta;
+            },
+        });
+
         this.setting = setting;
     }
 
@@ -628,6 +775,7 @@ export default class BrowserPlugin extends Plugin {
             this.historyStore.load(),
             this.downloadsStore.load(),
             this.settingsStore.load(),
+            this.extensionHost.load(),
         ]);
 
         // 探测 preload.js 的 file:// 路径（用于 webview 拦截新窗口）
@@ -783,17 +931,25 @@ export default class BrowserPlugin extends Plugin {
         return fallback;
     }
 
-    /** 打开 Dock */
+    /** 打开 Dock（未打开时通过思源内部 dock 实例的 toggleModel 打开） */
     private openDock(type: string): void {
-        // 思源未提供直接打开 Dock 的公共 API，通过 dock 配置的 hotkey 或自定义事件触发
-        // 这里使用 dock 实例的 element 显示，并通知思源布局
-        const dock = this.dockInstances.get(type);
-        if (dock) {
-            // 触发思源内部 dock 切换：通过点击 dock 的占位按钮（如果有）
-            // 兜底：直接显示 element
-            const evt = new CustomEvent("sy-browser-toggle-dock", { detail: { type } });
-            document.dispatchEvent(evt);
-            showMessage(this.i18n.bookmarks + " / " + this.i18n.history + " / " + this.i18n.downloads, 1500, "info");
+        try {
+            const item = document.querySelector(`.dock__item[data-type="${type}"]`) as HTMLElement | null;
+            if (!item) return;
+            const isOpen = item.classList.contains("dock__item--active") && !!this.dockInstances.get(type);
+            if (isOpen) return;
+            const layout = (window as any).siyuan?.layout;
+            const docks = [layout?.leftDock, layout?.rightDock, layout?.topDock, layout?.bottomDock];
+            for (const dock of docks) {
+                if (dock && typeof dock.toggleModel === "function" && type in (dock.data || {})) {
+                    dock.toggleModel(type, true, false, false, false, false);
+                    return;
+                }
+            }
+            // 兜底：模拟点击 dock 图标
+            item.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+        } catch (e) {
+            console.warn("[browser-plugin] openDock failed:", e);
         }
     }
 

@@ -12,6 +12,10 @@
 - **导航控制**：后退 / 前进 / 刷新 / 强制刷新 / 停止 / 主页
 - **页内查找**：Ctrl/Cmd+F 打开查找栏
 - **右键菜单**：后退 / 前进 / 刷新 / 在新页签打开 / 复制链接 / 复制图片 / 另存为 / 查看源代码 / 检查元素
+- **网页摘录（对齐官方剪藏扩展）**：整页摘录使用 Readability 正文提取 + 内核 lute 转 Markdown（`/api/extension/copy`），按模板组装后创建文档；选区摘录复制 Markdown 到剪贴板；可选下载图片到思源资源库（失败时内核自动转本地）；支持保存路径 / 标签 / 粗斜体下划线样式转换等高级选项
+- **Chrome 扩展支持**：在设置中安装未打包的 Chrome 扩展目录或 CRX / ZIP 扩展包（自动解析 CRX 头并解压到插件存储目录），扩展的内容脚本（含 CSS）会按 match pattern 注入到浏览器页签中的网页，并提供 `chrome.storage` / `chrome.i18n` / `chrome.runtime.getURL` 垫片（background / popup 不执行，部分扩展功能可能受限）
+- **原生 Electron 扩展加载**：通过 `@electron/remote` 调主进程 `session.loadExtension`，把扩展装入 webview 专用 session（真实 Chromium 内容脚本注入）；原生加载失败的扩展自动回退垫片模式。
+- **内置广告过滤（元素隐藏）**：页面加载时按 Adblock `##` 元素隐藏语法注入 CSS（内置常见广告网络与 tgb.cn 等站点规则，支持在设置中添加自定义规则）。渲染进程架构拿不到 webRequest，无法做网络层拦截，AdGuard 这类以网络拦截为主的扩展无法工作。
 - **新窗口拦截**：`target="_blank"` 链接和 `window.open()` 在新页签打开，而非系统浏览器
 - **书签 Dock**：树形结构 + 文件夹，增删改查，通过 `Plugin.saveData` 持久化
 - **历史 Dock**：按今天 / 昨天 / 7 天内 / 更早分组，搜索、清空全部、按日清空

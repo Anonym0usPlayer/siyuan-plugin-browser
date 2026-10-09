@@ -58,6 +58,10 @@ export class SettingsDialog {
         const nbOptions = notebooks
             .map((n) => `<option value="${n.id}" ${n.id === s.excerptNotebook ? "selected" : ""}>${escapeAttr(n.name)}</option>`)
             .join("");
+        // 已保存的笔记本 ID 失效（被删除/关闭）时显式标注，提示重新选择
+        const staleOption = s.excerptNotebook && !notebooks.some((n) => n.id === s.excerptNotebook)
+            ? `<option value="${escapeAttr(s.excerptNotebook)}" selected>(${escapeAttr(this.i18n.excerptNotebookStale || "已失效，请重新选择")})</option>`
+            : "";
         return `
         <div class="b3-form sb-settings">
             <div class="b3-form__row">
@@ -100,7 +104,24 @@ export class SettingsDialog {
                 <select id="sb-excerpt-nb">
                     <option value="">(${this.i18n.excerptNotebook})</option>
                     ${nbOptions}
+                    ${staleOption}
                 </select>
+            </div>
+            <div class="b3-form__row">
+                <label>${this.i18n.excerptParentPath || "摘录保存路径"}</label>
+                <input id="sb-excerpt-path" type="text" value="${escapeAttr(s.excerptParentPath || "/")}" placeholder="/"/>
+            </div>
+            <div class="b3-form__row">
+                <label>${this.i18n.excerptTags || "摘录标签"}</label>
+                <input id="sb-excerpt-tags" type="text" value="${escapeAttr(s.excerptTags || "")}" placeholder="web, clip"/>
+            </div>
+            <div class="b3-form__row">
+                <label>${this.i18n.excerptAssets || "摘录下载资源"}</label>
+                <input id="sb-excerpt-assets" type="checkbox" ${s.excerptAssets !== false ? "checked" : ""} />
+            </div>
+            <div class="b3-form__row">
+                <label>${this.i18n.extManager || "Chrome 扩展"}</label>
+                <button class="b3-button" id="sb-ext-manager">${this.i18n.extManageOpen || "管理扩展..."}</button>
             </div>
             <div class="b3-form__row">
                 <label>${this.i18n.interceptAllLinks}</label>
@@ -113,6 +134,17 @@ export class SettingsDialog {
             <div class="b3-form__row" style="font-size:12px;color:var(--b3-theme-on-surface-light);">
                 ${this.i18n.excludedSitesDesc}
             </div>
+            <div class="b3-form__row">
+                <label>${this.i18n.adBlockEnabled || "广告过滤"}</label>
+                <input id="sb-adblock" type="checkbox" ${s.adBlockEnabled !== false ? "checked" : ""} />
+            </div>
+            <div class="b3-form__row">
+                <label>${this.i18n.adBlockRules || "自定义广告规则"}</label>
+                <textarea id="sb-adblock-rules" rows="5" style="width:100%;resize:vertical;font-family:monospace;" placeholder="tgb.cn###tcAd&#10;example.com##.ad-banner&#10;##iframe[src*=&quot;pos.baidu.com&quot;]&#10;example.com#@#.keep-me">${escapeAttr(s.adBlockRules || "")}</textarea>
+            </div>
+            <div class="b3-form__row" style="font-size:12px;color:var(--b3-theme-on-surface-light);">
+                ${this.i18n.adBlockRulesDesc || "广告过滤为元素隐藏（CSS），不做网络拦截；修改后刷新页签生效。规则语法与 Adblock 一致：##选择器 全站生效，域名##选择器 仅该站点生效，域名#@#选择器 为例外。可直接粘贴 EasyList China 等公开列表的元素隐藏规则。"}
+            </div>
             <div class="b3-form__row sb-settings-actions">
                 <button class="b3-button" id="sb-save">${this.i18n.save}</button>
                 <button class="b3-button b3-button--cancel" id="sb-cancel">${this.i18n.cancel}</button>
@@ -120,6 +152,9 @@ export class SettingsDialog {
         </div>
         `;
     }
+
+    /** 由外部注入扩展宿主入口（BrowserTab 构造 SettingsDialog 时设置） */
+    extensionOpener?: () => void;
 
     private bindEvents(original: BrowserSettings): void {
         const root = this.dialog!.element;
@@ -148,8 +183,13 @@ export class SettingsDialog {
                 userAgent: (root.querySelector("#sb-useragent") as HTMLInputElement).value.trim(),
                 enablePreload: (root.querySelector("#sb-preload") as HTMLInputElement).checked,
                 excerptNotebook: (root.querySelector("#sb-excerpt-nb") as HTMLSelectElement).value,
+                excerptParentPath: (root.querySelector("#sb-excerpt-path") as HTMLInputElement).value.trim() || "/",
+                excerptTags: (root.querySelector("#sb-excerpt-tags") as HTMLInputElement).value.trim(),
+                excerptAssets: (root.querySelector("#sb-excerpt-assets") as HTMLInputElement).checked,
                 interceptAllLinks: (root.querySelector("#sb-intercept-all") as HTMLInputElement).checked,
                 excludedSites: (root.querySelector("#sb-excluded-sites") as HTMLTextAreaElement).value,
+                adBlockEnabled: (root.querySelector("#sb-adblock") as HTMLInputElement).checked,
+                adBlockRules: (root.querySelector("#sb-adblock-rules") as HTMLTextAreaElement).value,
             };
             await this.store.save(patch);
             showMessage(this.i18n.save + " ✓", 2000, "info");
@@ -158,6 +198,13 @@ export class SettingsDialog {
 
         root.querySelector("#sb-cancel")!.addEventListener("click", () => {
             this.dialog?.destroy();
+        });
+
+        const extBtn = root.querySelector("#sb-ext-manager") as HTMLButtonElement | null;
+        extBtn?.addEventListener("click", () => {
+            // 打开扩展管理前先关闭设置对话框，避免叠层
+            this.dialog?.destroy();
+            this.extensionOpener?.();
         });
     }
 }

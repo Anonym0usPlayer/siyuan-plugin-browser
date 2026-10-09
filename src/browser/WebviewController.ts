@@ -25,7 +25,7 @@ export class WebviewController {
         onToggleBookmark: () => void;
         onInspect: () => void;
         onFindResult?: (activeMatch: number, matches: number) => void;
-        onExcerpt?: () => void;
+        onExcerpt?: (mode: "article" | "part") => void;
     };
     private disposed = false;
     private listeners: Array<{ type: string; fn: (e: any) => void }> = [];
@@ -34,6 +34,22 @@ export class WebviewController {
     /** 去重：最近一次通过任意机制（ipc/new-window/will-navigate）打开的新标签页 URL + 时间 */
     private lastNewTabUrl = "";
     private lastNewTabTime = 0;
+    /** 最近一次已知的主框架 URL（webview 损坏后 getURL() 不可靠，重建时用它恢复） */
+    private lastKnownUrl = "";
+    /** 是否有导航正在进行（健康监测在加载期间跳过，避免误判） */
+    private loading = false;
+    /** 首次加载是否已完成（完成前不做健康监测，新页签初始 src 是 about:blank） */
+    private hasLoadedOnce = false;
+    /** 扩展内容脚本注入回调（dom-ready 时触发） */
+    onDomReady?: (webview: IWebviewTag, url: string) => void;
+
+    isLoading(): boolean {
+        return this.loading;
+    }
+
+    hasCompletedInitialLoad(): boolean {
+        return this.hasLoadedOnce;
+    }
 
     constructor(
         webview: IWebviewTag,
@@ -76,10 +92,13 @@ export class WebviewController {
 
     attach(): void {
         this.on("did-start-loading", () => {
+            this.loading = true;
             this.callbacks.onLoadingChange(true);
             this.faviconEverSet = false;
         });
         this.on("did-stop-loading", () => {
+            this.loading = false;
+            this.hasLoadedOnce = true;
             this.callbacks.onLoadingChange(false);
             // 兜底：通过 executeJavaScript 注入链接拦截器（即使 preload 失效也能工作）
             this.injectLinkInterceptor();
@@ -89,14 +108,25 @@ export class WebviewController {
         this.on("did-navigate", (e) => {
             this.programmaticNav = false;
             const url = e.url;
+            if (url && !url.startsWith("data:")) this.lastKnownUrl = url;
             this.callbacks.onUrlChange(url);
             this.maybeRecordHistory(url);
         });
         this.on("did-navigate-in-page", (e) => {
             this.programmaticNav = false;
             const url = e.url;
+            if (url && !url.startsWith("data:")) this.lastKnownUrl = url;
             this.callbacks.onUrlChange(url);
             this.maybeRecordHistory(url);
+        });
+        this.on("dom-ready", () => {
+            // 每次页面导航完成后触发：Chrome 扩展内容脚本在此注入
+            try {
+                const url = this.webview.getURL?.() || "";
+                if (/^https?:\/\//i.test(url)) {
+                    this.onDomReady?.(this.webview, url);
+                }
+            } catch {}
         });
         this.on("page-title-updated", (e) => {
             this.callbacks.onTitleChange(e.title);
@@ -195,7 +225,7 @@ export class WebviewController {
                     // 图片复制用 webview 内 clipboard API
                     this.webview.executeJavaScript(`fetch(${JSON.stringify(src)}).then(r=>r.blob()).then(b=>{const r=new FileReader();r.onload=()=>navigator.clipboard.write([new ClipboardItem({'image/png':b})]);r.readAsArrayBuffer(b);});`).catch(() => {});
                 },
-                excerpt: () => this.callbacks.onExcerpt?.(),
+                excerpt: (mode) => this.callbacks.onExcerpt?.(mode),
             });
         });
     }
@@ -233,7 +263,13 @@ export class WebviewController {
         }
         this.programmaticNav = true;
         if (this.settings.userAgent) {
-            await this.webview.loadURL(url, { userAgent: this.settings.userAgent });
+            try {
+                await this.webview.loadURL(url, { userAgent: this.settings.userAgent });
+            } catch {
+                // webview 尚未 attach（dom-ready 未触发）时 loadURL 会抛异常，回退到 src 赋值。
+                // useragent 属性已在 BrowserTab 构造时设置，src 导航同样带 UA。
+                this.webview.src = url;
+            }
         } else {
             this.webview.src = url;
         }
@@ -286,11 +322,60 @@ export class WebviewController {
     }
 
     getCurrentUrl(): string {
-        return this.webview.getURL?.() ?? this.webview.src;
+        try {
+            const url = this.webview.getURL?.() || "";
+            // 加载未提交时 getURL() 会返回初始的 about:blank，此时优先用已知 URL
+            if (url && url !== "about:blank") return url;
+            return this.lastKnownUrl || url || this.webview.src || "";
+        } catch {
+            return this.lastKnownUrl || "";
+        }
     }
 
     getCurrentTitle(): string {
-        return this.webview.getTitle?.() ?? "";
+        try {
+            return this.webview.getTitle?.() ?? "";
+        } catch {
+            return "";
+        }
+    }
+
+    /**
+     * 探测 webview 是否仍然健康。
+     * 思源分屏/拖动页签会把 panelElement 在 DOM 中搬移，Electron webview 一旦
+     * 被重新挂载，内部 guest 即被销毁：页面变白、reload/点击全部无响应。
+     * 通过带超时的 executeJavaScript 探测，失败即认为损坏，需要重建。
+     */
+    async isHealthy(timeoutMs = 800): Promise<boolean> {
+        try {
+            if (!this.webview?.isConnected) return false;
+            await Promise.race([
+                this.webview.executeJavaScript("1"),
+                new Promise((_, reject) => setTimeout(() => reject(new Error("health check timeout")), timeoutMs)),
+            ]);
+            return true;
+        } catch {
+            return false;
+        }
+    }
+
+    /**
+     * 重挂载到新的 webview 元素（旧元素已损坏）。
+     * 移除旧元素上的全部事件监听，在新元素上重新注册。
+     */
+    reattach(webview: IWebviewTag): void {
+        for (const { type, fn } of this.listeners) {
+            try {
+                this.webview.removeEventListener(type, fn);
+            } catch {}
+        }
+        this.listeners = [];
+        this.webview = webview;
+        this.programmaticNav = false;
+        this.loading = false;
+        this.lastNewTabUrl = "";
+        this.lastNewTabTime = 0;
+        this.attach();
     }
 
     dispose(): void {

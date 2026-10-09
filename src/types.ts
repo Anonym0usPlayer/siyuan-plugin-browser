@@ -80,10 +80,32 @@ export interface BrowserSettings {
     enablePreload: boolean;
     /** 摘录保存的笔记本 ID */
     excerptNotebook: string;
+    /** 摘录保存路径（人类可读路径，默认根 "/"/，支持 {{...}} sprig 模板） */
+    excerptParentPath: string;
+    /** 摘录文档标签（逗号分隔） */
+    excerptTags: string;
+    /** 摘录时是否下载资源文件到思源 assets */
+    excerptAssets: boolean;
+    /** 摘录前处理：粗体样式转 <b> */
+    excerptExpBold: boolean;
+    /** 摘录前处理：斜体样式转 <i> */
+    excerptExpItalic: boolean;
+    /** 摘录前处理：下划线样式转 <u> */
+    excerptExpUnderline: boolean;
+    /** 摘录前处理：移除图片链接 */
+    excerptExpRemoveImgLink: boolean;
+    /** 摘录前处理：span 换行转 <br> */
+    excerptExpSpan: boolean;
+    /** 摘录前处理：内嵌 SVG 转图片 */
+    excerptExpSvgToImg: boolean;
     /** 所有 http(s) 链接都用浏览器插件打开（拦截全局点击） */
     interceptAllLinks: boolean;
     /** 排除网站列表（每行一个 hostname，匹配的 URL 在系统默认浏览器打开） */
     excludedSites: string;
+    /** 内置广告过滤（元素隐藏）开关 */
+    adBlockEnabled: boolean;
+    /** 用户自定义广告隐藏规则（adblock ## 语法，每行一条） */
+    adBlockRules: string;
 }
 
 /** webview 元素的扩展类型（Electron webview tag） */
@@ -104,6 +126,7 @@ export interface IWebviewTag extends HTMLElement {
     reloadIgnoringCache(): void;
     stop(): void;
     executeJavaScript(code: string, userGesture?: boolean): Promise<any>;
+    insertCSS(css: string): Promise<string>;
     downloadURL(url: string, options?: { filename?: string }): void;
     findInPage(text: string, options?: { forward?: boolean; findNext?: boolean; matchCase?: boolean }): void;
     stopFindInPage(action: "clearSelection" | "keepSelection" | "activateSelection"): void;
