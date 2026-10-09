@@ -5,6 +5,7 @@
  * 1. 拦截 window.open() 调用 → 通过 ipcRenderer.sendToHost 通知父进程在新页签打开
  * 2. 拦截所有 <a> 链接点击 → 同上（在思源新标签页打开，而非在当前 webview 内导航）
  * 3. 拦截 form[target=_blank] 提交
+ * 4. 扩展页面（chrome-extension://）下补齐 Electron 缺失的 chrome.storage.sync
  *
  * 注意：该脚本由 Electron webview 在隔离上下文中执行，可直接 require('electron')。
  * 不经过 webpack 打包，作为静态资源由 CopyWebpackPlugin 复制到 .src/preload.js。
@@ -226,7 +227,28 @@
             } catch (e) {}
         });
 
-        // === 4. Edge 加载项商店：补齐 navigator.userAgentData 的 Edge 品牌 ===
+        // === 4. 扩展页面：把 chrome.storage.sync 代理到 local ===
+        //
+        // Electron 只实现了 chrome.storage.local。sync **属性存在**（读它是 object），
+        // 但一调用就抛
+        //   Error: "sync" is not available in this instance of Chrome
+        // （sync 依赖 Google 账号同步服务，Electron 没有）。
+        // 实测 SiYuan Clip 把设置几乎全存在 sync 里 —— 一读就抛错，
+        // 整个设置页渲染中断变成空白页。
+        //
+        // 所以这里**无条件**把 sync 代理到 local：读写语义一致，只是不同步到云端。
+        // 不能用 `if (!chrome.storage.sync)` 判断要不要代理 —— 属性是存在的，
+        // 那样判断永远不成立（实测踩过）。
+        try {
+            if (/^chrome-extension:\/\//i.test(location.href) && typeof chrome !== "undefined" && chrome.storage && chrome.storage.local) {
+                Object.defineProperty(chrome.storage, "sync", {
+                    configurable: true,
+                    get: function () { return chrome.storage.local; },
+                });
+            }
+        } catch (e) {}
+
+        // === 5. Edge 加载项商店：补齐 navigator.userAgentData 的 Edge 品牌 ===
         //
         // 商店只在**页面加载时判定一次**浏览器兼容性（实测：加载后无论怎么改 UA /
         // userAgentData，「获取」按钮都不会重新变绿），所以必须在页面脚本执行前
