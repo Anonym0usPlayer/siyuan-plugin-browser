@@ -33,9 +33,9 @@ const DEFAULT_TIMEOUT_MS = 60_000;
 const DEFAULT_MAX_REDIRECTS = 8;
 const REDIRECT_STATUSES = [301, 302, 303, 307, 308];
 
-/** 伪装 Edge 浏览器 UA，避免商店接口按客户端过滤 */
-const EDGE_UA =
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 Edg/126.0.0.0";
+/** 伪装 Edge 浏览器 UA：商店页会 UA 嗅探（非 Edge 直接禁用「获取」按钮并提示不兼容），下载接口同样带上 */
+export const EDGE_UA =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36 Edg/141.0.0.0";
 
 export interface IEdgeAddonMeta {
     name?: string;

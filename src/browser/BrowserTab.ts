@@ -9,6 +9,8 @@ import type { BookmarksStore } from "../storage/bookmarksStore";
 import type { SettingsStore } from "../storage/settingsStore";
 import { SettingsDialog } from "../settings/SettingsDialog";
 import { clipToSiYuan } from "./excerpt";
+import { EDGE_UA } from "../extensions/edgeStore";
+import { isEdgeAddonsSiteUrl } from "../extensions/edgeStoreHelper";
 import { BROWSER_PARTITION } from "../constants";
 import { remoteSession } from "../utils/electron";
 
@@ -49,6 +51,10 @@ export class BrowserTab {
     private healthTimer: any = null;
     /** 连续健康检查失败计数（连续 2 次才判定损坏） */
     private healthFailCount = 0;
+    /** Electron 默认 UA（懒捕获：构造时 webview 可能尚未 attach） */
+    private defaultUserAgent = "";
+    /** 当前是否处于商店伪装 UA 态（离开商店时恢复默认） */
+    private edgeUaActive = false;
 
     constructor(deps: BrowserTabDeps, initialUrl?: string) {
         this.deps = deps;
@@ -69,6 +75,7 @@ export class BrowserTab {
                 onUrlChange: (url) => {
                     this.toolbar.setUrl(url);
                     this.updateBookmarkButton(url);
+                    this.syncUserAgent(url);
                 },
                 onTitleChange: (title) => {
                     deps.onTabTitleChange(title);
@@ -252,6 +259,8 @@ export class BrowserTab {
         console.log("[browser-plugin] BrowserTab.init, initialUrl:", initialUrl);
         const start = initialUrl || this.settings.homepage;
         if (start && start !== "about:blank") {
+            // 先切好 UA 再发首次请求（商店域名需伪装 Edge，否则页内禁用「获取」按钮）
+            this.syncUserAgent(start);
             // 先加载 URL（不等 preload，preload 只影响后续页内链接拦截）
             console.log("[browser-plugin] loading URL:", start);
             this.controller.loadURL(start);
@@ -260,6 +269,37 @@ export class BrowserTab {
         }
         // 异步设置 preload（不阻塞首次加载；对后续导航生效）
         this.applyPreload();
+    }
+
+    /**
+     * 按目标 URL 切换 webview UA。
+     * Edge 加载项商店会对 UA 嗅探：非 Edge 浏览器直接禁用「获取」按钮并提示
+     * "与你的浏览器不兼容"，因此在商店域名下伪装 Edge UA，离开后恢复
+     * （自定义 UA 优先，否则用 Electron 默认）。webview 的 useragent 属性
+     * 映射 contents.setUserAgent，对后续导航的 HTTP 头与页内 navigator.userAgent 同时生效。
+     */
+    private syncUserAgent(url: string): void {
+        try {
+            const isStore = isEdgeAddonsSiteUrl(url);
+            if (!isStore && !this.edgeUaActive) return;
+            if (!this.defaultUserAgent) {
+                this.defaultUserAgent =
+                    (this.webview as any).getUserAgent?.() ||
+                    (window as any).navigator?.userAgent ||
+                    "";
+            }
+            const ua = isStore ? EDGE_UA : this.settings.userAgent || this.defaultUserAgent;
+            this.edgeUaActive = isStore;
+            if (ua && this.webview.useragent !== ua) {
+                this.webview.setAttribute("useragent", ua);
+                try {
+                    (this.webview as any).useragent = ua;
+                } catch {}
+                console.log("[browser-plugin] webview UA ->", isStore ? "Edge (store)" : "default/custom");
+            }
+        } catch (e) {
+            console.warn("[browser-plugin] syncUserAgent failed:", e);
+        }
     }
 
     /** 从插件主实例获取 preload 路径并应用到 webview */
@@ -371,9 +411,11 @@ export class BrowserTab {
             this.webview.replaceWith(newWebview);
             this.webview = newWebview;
             this.controller.reattach(newWebview);
-            // getCurrentUrl 会优先返回已知 URL（加载未提交时 getURL 是 about:blank），
-            // 这里无条件恢复，避免重建后停留在空白页
+            // 重建后的 webview 恢复 UA（商店页需重新伪装 Edge）
+            this.edgeUaActive = false;
             if (savedUrl) {
+                // 无条件恢复（加载未提交时 getURL 是 about:blank，getCurrentUrl 可能取不到）
+                this.syncUserAgent(savedUrl);
                 await this.controller.loadURL(savedUrl);
             }
             console.log("[browser-plugin] webview rebuilt, url:", savedUrl);
