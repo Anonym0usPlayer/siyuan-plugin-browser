@@ -55,6 +55,8 @@ export class BrowserTab {
     private defaultUserAgent = "";
     /** 当前是否处于商店伪装 UA 态（离开商店时恢复默认） */
     private edgeUaActive = false;
+    /** 已经实际应用到 webContents 的 UA（避免重复设置；webview.useragent 属性不可信） */
+    private appliedUserAgent = "";
 
     constructor(deps: BrowserTabDeps, initialUrl?: string) {
         this.deps = deps;
@@ -273,10 +275,15 @@ export class BrowserTab {
 
     /**
      * 按目标 URL 切换 webview UA。
-     * Edge 加载项商店会对 UA 嗅探：非 Edge 浏览器直接禁用「获取」按钮并提示
+     * Edge 加载项商店会 UA 嗅探：非 Edge 浏览器直接禁用「获取」按钮并提示
      * "与你的浏览器不兼容"，因此在商店域名下伪装 Edge UA，离开后恢复
-     * （自定义 UA 优先，否则用 Electron 默认）。webview 的 useragent 属性
-     * 映射 contents.setUserAgent，对后续导航的 HTTP 头与页内 navigator.userAgent 同时生效。
+     * （自定义 UA 优先，否则用 Electron 默认）。
+     *
+     * 必须用 webContents.setUserAgent()：<webview useragent="..."> 属性在
+     * Electron 44（思源 3.8.6 自带）下**实测无效** —— 属性读得回正确值，
+     * 但页内 navigator.userAgent 始终是 Electron 默认的
+     * "…SiYuan/3.8.6 Chrome/152…Electron/44.4.5…"，reload 也不变。
+     * 走 webContents 则立即生效（含当前已加载页面）。
      */
     private syncUserAgent(url: string): void {
         try {
@@ -290,15 +297,38 @@ export class BrowserTab {
             }
             const ua = isStore ? EDGE_UA : this.settings.userAgent || this.defaultUserAgent;
             this.edgeUaActive = isStore;
-            if (ua && this.webview.useragent !== ua) {
-                this.webview.setAttribute("useragent", ua);
-                try {
-                    (this.webview as any).useragent = ua;
-                } catch {}
-                console.log("[browser-plugin] webview UA ->", isStore ? "Edge (store)" : "default/custom");
+            if (ua && this.appliedUserAgent !== ua) {
+                const wc = this.webContents();
+                if (wc?.setUserAgent) {
+                    wc.setUserAgent(ua);
+                    this.appliedUserAgent = ua;
+                    console.log("[browser-plugin] webview UA ->", isStore ? "Edge (store)" : "default/custom");
+                } else {
+                    // 拿不到 webContents：退回属性方式，至少 HTTP 头可能生效
+                    this.webview.setAttribute("useragent", ua);
+                    try {
+                        (this.webview as any).useragent = ua;
+                    } catch {}
+                    this.appliedUserAgent = ua;
+                    console.log("[browser-plugin] webview UA (attr fallback) ->", isStore ? "Edge (store)" : "default/custom");
+                }
             }
         } catch (e) {
             console.warn("[browser-plugin] syncUserAgent failed:", e);
+        }
+    }
+
+    /** 取 webview 对应的 webContents（经 @electron/remote）；拿不到返回 null */
+    private webContents(): any | null {
+        try {
+            const req = (window as any).require;
+            const remote = req?.("@electron/remote");
+            if (!remote?.webContents?.fromId) return null;
+            const id = (this.webview as any).getWebContentsId?.();
+            if (typeof id !== "number") return null;
+            return remote.webContents.fromId(id);
+        } catch {
+            return null;
         }
     }
 
@@ -412,7 +442,9 @@ export class BrowserTab {
             this.webview = newWebview;
             this.controller.reattach(newWebview);
             // 重建后的 webview 恢复 UA（商店页需重新伪装 Edge）
+            // appliedUserAgent 也要清：新 webview 是新 webContents，旧的已应用值不再适用
             this.edgeUaActive = false;
+            this.appliedUserAgent = "";
             if (savedUrl) {
                 // 无条件恢复（加载未提交时 getURL 是 about:blank，getCurrentUrl 可能取不到）
                 this.syncUserAgent(savedUrl);

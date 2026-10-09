@@ -226,6 +226,54 @@
             } catch (e) {}
         });
 
+        // === 4. Edge 加载项商店：补齐 navigator.userAgentData 的 Edge 品牌 ===
+        //
+        // 商店只在**页面加载时判定一次**浏览器兼容性（实测：加载后无论怎么改 UA /
+        // userAgentData，「获取」按钮都不会重新变绿），所以必须在页面脚本执行前
+        // 就准备好 —— preload 正好是这个时机（webpreferences 里 contextIsolation=no，
+        // preload 与页面共享 window，这里改 navigator 页面看得到）。
+        //
+        // webContents.setUserAgent() 只能改 UA 字符串，改不动 userAgentData：
+        // 实测 UA 已是 "…Edg/141.0.0.0"，但 brands 仍是 [Not?A_Brand, Chromium/152]，
+        // 商店据此判定"与你的浏览器不兼容"并禁用「获取」。
+        try {
+            if (/^https?:\/\/microsoftedge\.microsoft\.com\//i.test(location.href)) {
+                const edgeBrands = [
+                    {brand: "Not?A_Brand", version: "24"},
+                    {brand: "Chromium", version: "141"},
+                    {brand: "Microsoft Edge", version: "141"},
+                ];
+                const fullVersionList = [
+                    {brand: "Chromium", version: "141.0.0.0"},
+                    {brand: "Microsoft Edge", version: "141.0.0.0"},
+                ];
+                const uaData = {
+                    brands: edgeBrands,
+                    mobile: false,
+                    platform: "Windows",
+                    architecture: "x86",
+                    bitness: "64",
+                    getHighEntropyValues: function () {
+                        return Promise.resolve({
+                            architecture: "x86",
+                            bitness: "64",
+                            model: "",
+                            platformVersion: "15.0.0",
+                            uaFullVersion: "141.0.0.0",
+                            fullVersionList: fullVersionList,
+                        });
+                    },
+                    toJSON: function () {
+                        return {brands: edgeBrands, mobile: false, platform: "Windows"};
+                    },
+                };
+                Object.defineProperty(navigator, "userAgentData", {
+                    configurable: true,
+                    get: function () { return uaData; },
+                });
+            }
+        } catch (e) {}
+
         // 标记已注入，便于父进程通过 executeJavaScript 验证
         window.__browserPluginPreloadInjected = true;
     } catch (err) {
