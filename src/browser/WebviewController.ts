@@ -285,8 +285,21 @@ export class WebviewController {
                     this.webview.executeJavaScript(`fetch(${JSON.stringify(src)}).then(r=>r.blob()).then(b=>{const r=new FileReader();r.onload=()=>navigator.clipboard.write([new ClipboardItem({'image/png':b})]);r.readAsArrayBuffer(b);});`).catch(() => {});
                 },
                 excerpt: (mode) => this.callbacks.onExcerpt?.(mode),
-            });
+                onExtensionMenuItem: (item) => this.onExtMenuItem?.(item),
+            }, this.extMenuProvider ? this.extMenuProvider() : []);
         });
+    }
+
+    /** 扩展右键菜单项：BrowserTab 注入（缓存读取）与点击回调 */
+    private extMenuProvider?: () => Array<{ id: string; title: string; electronId: string; extPath: string }>;
+    private onExtMenuItem?: (item: { id: string; title: string; electronId: string; extPath: string }) => void;
+
+    setExtensionMenuSource(
+        provider: () => Array<{ id: string; title: string; electronId: string; extPath: string }>,
+        onClick: (item: { id: string; title: string; electronId: string; extPath: string }) => void,
+    ): void {
+        this.extMenuProvider = provider;
+        this.onExtMenuItem = onClick;
     }
 
     /** 更新设置引用（设置变更后调用） */

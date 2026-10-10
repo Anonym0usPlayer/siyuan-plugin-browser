@@ -172,7 +172,7 @@ export class ExtensionHost {
      */
     private injectBackgroundShims(): void {
         const { fs, path } = nodeModules();
-        const SHIM_MARK = "/* sy-bg-shim:v2 */";
+        const SHIM_MARK = "/* sy-bg-shim:v3 */";
         let changedShimCount = 0;
         for (const ext of this.extensions) {
             try {
@@ -216,6 +216,28 @@ export class ExtensionHost {
         if (chrome.commands && !chrome.commands.getAll) {
             chrome.commands.getAll = function (cb) { cb && cb([]); };
         }
+        // 3) onInstalled 补发：Electron 不触发 runtime.onInstalled，而不少扩展
+        //    把 contextMenus.create 全放它的回调里（实测 SiYuan Clip）——
+        //    不补发则菜单注册永不执行。SW 每次唤醒补发一次正符合
+        //    "重启需重新注册内存态菜单"的生命周期语义。
+        try {
+            if (chrome.runtime && chrome.runtime.onInstalled && !chrome.runtime.onInstalled.__syWrapped) {
+                var oiFns = [];
+                var wrapped = {
+                    addListener: function (fn) { if (typeof fn === "function") oiFns.push(fn); },
+                    removeListener: function (fn) { var i = oiFns.indexOf(fn); if (i >= 0) oiFns.splice(i, 1); },
+                };
+                Object.defineProperty(chrome.runtime, "onInstalled", {
+                    configurable: true,
+                    get: function () { return wrapped; },
+                });
+                wrapped.__syWrapped = true;
+                // Chromium 原生触发在 Electron 下不存在；延迟让扩展先完成顶层注册
+                setTimeout(function () {
+                    oiFns.forEach(function (fn) { try { fn({ reason: "install" }); } catch (e) {} });
+                }, 200);
+            }
+        } catch (e) {}
         // 2) contextMenus 特化：记录注册项，点击经 storage 通道由宿主触发
         if (!chrome.contextMenus.__syStore) {
             var store = { items: {}, click: eventHub() };

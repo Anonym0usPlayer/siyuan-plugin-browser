@@ -14,6 +14,8 @@ import { isEdgeAddonsSiteUrl } from "../extensions/edgeStoreHelper";
 import { BROWSER_PARTITION } from "../constants";
 import { remoteSession } from "../utils/electron";
 import { showExtensionPopupInPage, closeExtensionPopupInPage } from "./ext-popup";
+import { listExtensionMenuItems, triggerExtensionMenuClick } from "../extensions/sw-bridge";
+import type { IExtensionMenuItem } from "./contextMenu";
 
 /** 图标文件 → data URL 缓存（key 为 path+相对路径；读失败/非图片返回 undefined 且不缓存） */
 const iconDataUrlCache = new Map<string, string>();
@@ -196,6 +198,19 @@ export class BrowserTab {
                 this.toolbar.renderExtensionBar();
             });
         } catch {}
+        // 扩展 contextMenus 项预热（SiYuan Clip 等）：SW 查询慢且可能唤醒，
+        // 后台预热进缓存，右键弹出时同步取用；5 分钟过期后台再刷
+        this.controller.setExtensionMenuSource(
+            () => this.getExtMenuItems(),
+            (item) => {
+                void triggerExtensionMenuClick(
+                    { electronId: item.electronId, path: item.extPath },
+                    { menuItemId: item.id, pageUrl: this.webview.getURL() },
+                    { wakeUp: () => this.wakeExtSw() },
+                );
+            },
+        );
+        this.preheatExtMenuItems();
 
         // 监听设置变化
         deps.settings.onChange(() => {
@@ -233,6 +248,58 @@ export class BrowserTab {
         // 异步初始化：先确保 preload 路径就绪，再加载初始 URL
         // preload 必须在 webview 第一次加载前设置，否则不生效
         this.init(initialUrl);
+    }
+
+    /** 扩展右键菜单项缓存（跨标签共享，按扩展合并） */
+    private static extMenuCache: IExtensionMenuItem[] = [];
+    private static extMenuCacheAt = 0;
+    private static extMenuPreheated = false;
+
+    private getExtMenuItems(): IExtensionMenuItem[] {
+        if (Date.now() - BrowserTab.extMenuCacheAt > 5 * 60_000) {
+            // 过期：返回现有缓存的同时后台刷新（右键不能等 SW 慢查询）
+            this.preheatExtMenuItems();
+        }
+        return BrowserTab.extMenuCache;
+    }
+
+    private preheatExtMenuItems(): void {
+        if (BrowserTab.extMenuPreheated) return;
+        BrowserTab.extMenuPreheated = true;
+        const run = async () => {
+            const host = (window as any).browserPlugin?.extensionHost;
+            const candidates = (host?.list?.() || []).filter((e: any) => e.enabled && e.native && e.electronId);
+            const all: IExtensionMenuItem[] = [];
+            for (const ext of candidates) {
+                try {
+                    const items = await listExtensionMenuItems(
+                        { electronId: ext.electronId, path: ext.path },
+                        { wakeUp: () => this.wakeExtSw() },
+                    );
+                    for (const it of items) {
+                        all.push({ id: it.id, title: it.title, electronId: ext.electronId, extPath: ext.path });
+                    }
+                } catch {}
+            }
+            BrowserTab.extMenuCache = all;
+            BrowserTab.extMenuCacheAt = Date.now();
+        };
+        // 延迟预热：避开标签构造期的加载高峰
+        setTimeout(() => { void run(); }, 2000);
+    }
+
+    /** 唤醒扩展 SW（remove+load 触发 onInstalled，垫片 v3 会补发并重注册菜单） */
+    private async wakeExtSw(): Promise<void> {
+        try {
+            const ses = remoteSession();
+            if (!ses) return;
+            const host = (window as any).browserPlugin?.extensionHost;
+            const candidates = (host?.list?.() || []).filter((e: any) => e.enabled && e.native && e.electronId);
+            for (const ext of candidates) {
+                try { ses.removeExtension(ext.electronId); } catch {}
+                try { await ses.loadExtension(ext.path, { allowFileAccess: true }); } catch {}
+            }
+        } catch {}
     }
 
     /** 在当前浏览器标签页中加载新 URL（替换当前页，浏览器行为） */
