@@ -15,6 +15,8 @@ import { BROWSER_PARTITION } from "../constants";
 import { remoteSession } from "../utils/electron";
 import { showExtensionPopupInPage, closeExtensionPopupInPage } from "./ext-popup";
 import { listExtensionMenuItems, evalInExtensionWorld } from "../extensions/sw-bridge";
+import { evalPopupJs } from "../extensions/cs-runtime";
+import { POPUP_JS_PRELUDE } from "./ext-popup";
 import type { IExtensionMenuItem } from "./contextMenu";
 
 /** 图标文件 → data URL 缓存（key 为 path+相对路径；读失败/非图片返回 undefined 且不缓存） */
@@ -509,12 +511,27 @@ export class BrowserTab {
         const r = anchor
             ? anchor.getBoundingClientRect()
             : ({ right: (window.innerWidth || 1200) - 24, bottom: 48 } as DOMRect);
+        // popup JS 在扩展专属世界执行（chrome.* 经桥真实可用；主世界是空壳），
+        // 前奏把 document.getElementById/querySelector 重绑定到面板的 shadow root
+        const extInfo = {
+            electronId: ext.electronId,
+            path: ext.path,
+            name: ext.name,
+            version: ext.version,
+            defaultLocale: ext.defaultLocale,
+            contentScripts: ext.contentScripts,
+        };
         const out = await showExtensionPopupInPage({
             webview: this.webview,
             extPath: ext.path,
             electronId: ext.electronId,
             popupPath: ext.popupPath,
             anchorRect: { right: r.right, bottom: r.bottom },
+            evalJs: (src) =>
+                evalPopupJs(this.webview, extInfo, POPUP_JS_PRELUDE + "\n" + src).then((rr) => {
+                    if (!rr.ok) throw new Error(rr.error);
+                    return rr.value;
+                }),
         });
         if (!out.ok) {
             showMessage(`打开「${ext.name}」面板失败: ${out.error}`, 5000, "error");

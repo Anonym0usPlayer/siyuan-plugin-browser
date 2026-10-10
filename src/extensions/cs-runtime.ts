@@ -31,6 +31,8 @@ import type { IWebviewTag } from "../types";
 import { CS_WORLD_PREFIX, cdpEvalOnce, findSwTarget } from "./sw-bridge";
 
 const BRIDGE_NAME = "__syExtHost";
+/** popup/options 页专属世界前缀（独立于 content 世界，避免顶层声明冲突） */
+const POPUP_WORLD_PREFIX = "__syCsPop_";
 
 export interface ICsExtInfo {
     electronId: string;
@@ -64,6 +66,15 @@ export function ensureCsRuntime(webview: IWebviewTag): void {
 
 export function disposeCsRuntime(webview: IWebviewTag): void {
     manager?.disposeFor(webview);
+}
+
+/**
+ * 在扩展的 popup 世界里执行表达式（chrome.* 经桥全可用；DOM 与页面共享）。
+ * 用于把扩展 popup/options 页的 JS 从主世界（chrome 空壳）搬进来跑。
+ */
+export async function evalPopupJs(webview: IWebviewTag, ext: ICsExtInfo, expr: string): Promise<{ ok: boolean; value?: any; error?: string }> {
+    if (!manager) return { ok: false, error: "cs-runtime 未初始化" };
+    return manager.evalPopupJs(webview, ext, expr);
 }
 
 // ===== Chrome match pattern（与 extensionHost 同款，独立副本避免模块循环） =====
@@ -158,13 +169,32 @@ class CsRuntimeManager {
             this.sessions.delete(key);
         }
     }
+
+    async evalPopupJs(webview: IWebviewTag, ext: ICsExtInfo, expr: string): Promise<{ ok: boolean; value?: any; error?: string }> {
+        const pageUrl = safeUrl(webview);
+        if (!/^https?:\/\//i.test(pageUrl)) return { ok: false, error: "非 http(s) 页面" };
+        const wc = remoteWebContents(webview);
+        if (!wc) return { ok: false, error: "webContents 不可用" };
+        const key = String(wc.id);
+        let s = this.sessions.get(key);
+        if (!s || !s.alive) {
+            s = new CsPageSession(wc, pageUrl, this.host, () => this.sessions.delete(key));
+            this.sessions.set(key, s);
+            await s.start();
+        }
+        s.pageUrl = pageUrl;
+        const ctxId = await s.ensurePopupWorld(ext);
+        return s.evaluateInWorld(ctxId, expr);
+    }
 }
 
 class CsPageSession {
     private seq = 0;
     private frameId: string | null = null;
-    /** electronId → 自建世界 contextId */
-    private worlds = new Map<string, number>();
+    /** electronId → content 世界 contextId（跑内容脚本） */
+    private contentWorlds = new Map<string, number>();
+    /** electronId → popup 世界 contextId（跑扩展 popup/options 页 JS，避免与 CS 顶层声明冲突） */
+    private popupWorlds = new Map<string, number>();
     /** 当前文档已执行过 CS 入口的扩展（导航后清空） */
     private ran = new Set<string>();
     private attached = false;
@@ -223,7 +253,8 @@ class CsPageSession {
         if (method === "Page.frameNavigated" && params?.frame && !params.frame.parentId) {
             // 主框架导航：世界与执行标记全部作废，sync 时按新文档重建
             this.frameId = String(params.frame.id || this.frameId);
-            this.worlds.clear();
+            this.contentWorlds.clear();
+            this.popupWorlds.clear();
             this.ran.clear();
             this.ctxToExt.clear();
             return;
@@ -247,7 +278,7 @@ class CsPageSession {
     }
 
     private async installExt(ext: ICsExtInfo): Promise<void> {
-        if (this.worlds.has(ext.electronId) && this.ran.has(ext.electronId)) return;
+        if (this.contentWorlds.has(ext.electronId) && this.ran.has(ext.electronId)) return;
         // 只把「源码引用 chrome.*」的内容脚本搬进自建世界：纯 DOM 型扩展
         // （Eruda 等）在原生世界本来就正常，重复执行会出双份 UI
         const groups = (ext.contentScripts || []).filter((cs) =>
@@ -265,7 +296,7 @@ class CsPageSession {
         );
         if (!needsCsRt) return;
 
-        let ctxId = this.worlds.get(ext.electronId);
+        let ctxId = this.contentWorlds.get(ext.electronId);
         if (!ctxId) {
             const r: any = await this.send("Page.createIsolatedWorld", {
                 frameId: this.frameId,
@@ -275,7 +306,7 @@ class CsPageSession {
             });
             ctxId = r?.executionContextId;
             if (!ctxId) throw new Error("createIsolatedWorld 未返回 contextId");
-            this.worlds.set(ext.electronId, ctxId);
+            this.contentWorlds.set(ext.electronId, ctxId);
             await this.send("Runtime.addBinding", { name: BRIDGE_NAME, executionContextId: ctxId });
             const shim = buildShim(ext, this.host.messages(ext.path, ext.defaultLocale));
             const sr: any = await this.send("Runtime.evaluate", {
@@ -333,7 +364,7 @@ class CsPageSession {
         }
         let electronId = this.ctxToExt.get(ctxId);
         if (!electronId) {
-            for (const [eid, cid] of this.worlds) {
+            for (const [eid, cid] of [...this.contentWorlds, ...this.popupWorlds]) {
                 if (cid === ctxId) {
                     electronId = eid;
                     this.ctxToExt.set(ctxId, eid);
@@ -388,6 +419,10 @@ class CsPageSession {
         if (req.type === "sendmessage") {
             return await this.routeSendMessage(ext, args);
         }
+        if (req.type === "tabs-sendmessage") {
+            // popup 世界 → content 世界的 onMessage 监听器（SW↔CS 路由缺失的替代）
+            return await this.dispatchToContentWorld(ext, args);
+        }
         return { err: "unknown bridge type: " + req.type };
     }
 
@@ -437,6 +472,107 @@ class CsPageSession {
         } catch {
             return { data: undefined };
         }
+    }
+
+    /** popup 世界 tabs.sendMessage → content 世界的 onMessage 监听器直调 */
+    private async dispatchToContentWorld(ext: ICsExtInfo, args: any): Promise<{ data?: any; err?: string }> {
+        const ctxId = this.contentWorlds.get(ext.electronId);
+        if (!ctxId) return { data: undefined }; // 内容世界未就绪（页面刚导航？）——按无接收方回调 undefined
+        const msgJson = JSON.stringify(args.msg === undefined ? null : args.msg);
+        const senderJson = JSON.stringify({
+            tab: { id: typeof args.tabId === "number" ? args.tabId : 1 },
+            url: String(args.senderUrl || "").slice(0, 300),
+        });
+        const r = await this.send(
+            "Runtime.evaluate",
+            {
+                expression: `(async () => {
+                    const fns = self.__syCsOnMessageFns || [];
+                    if (!fns.length) return JSON.stringify({ __noReceivers: true });
+                    return await new Promise((resolve) => {
+                        let done = false;
+                        const finish = (v) => {
+                            if (done) return;
+                            done = true;
+                            clearTimeout(timer);
+                            resolve(JSON.stringify(v === undefined ? null : v));
+                        };
+                        const timer = setTimeout(() => finish(null), 25000);
+                        let asyncWait = false;
+                        const sendResponse = (resp) => finish(resp);
+                        for (const fn of fns) {
+                            try {
+                                const r = fn(${msgJson}, ${senderJson}, sendResponse);
+                                if (r === true) {
+                                    asyncWait = true;
+                                } else if (r !== undefined && !(r && typeof r.then === "function")) {
+                                    sendResponse(r);
+                                    break;
+                                }
+                            } catch (e) {}
+                        }
+                        if (!asyncWait && !done) finish(undefined);
+                    });
+                })()`,
+                contextId: ctxId,
+                returnByValue: true,
+                awaitPromise: true,
+            },
+            30000
+        );
+        if ((r as any)?.exceptionDetails) {
+            return { err: String((r as any).exceptionDetails?.exception?.description || "content world 派发异常").slice(0, 200) };
+        }
+        try {
+            const parsed = JSON.parse(String((r as any)?.result?.value));
+            if (parsed && parsed.__noReceivers) return { data: undefined };
+            return { data: parsed === null ? undefined : parsed };
+        } catch {
+            return { data: undefined };
+        }
+    }
+
+    /** 在指定执行上下文里 evaluate（供 popup 世界等复用） */
+    async evaluateInWorld(ctxId: number, expr: string, timeoutMs = 30000): Promise<{ ok: boolean; value?: any; error?: string }> {
+        try {
+            const r: any = await this.send(
+                "Runtime.evaluate",
+                { expression: expr, contextId: ctxId, returnByValue: true, awaitPromise: true },
+                timeoutMs
+            );
+            if (r?.exceptionDetails) {
+                return {
+                    ok: false,
+                    error: String(r.exceptionDetails?.exception?.description || r.exceptionDetails?.text || "执行异常").slice(0, 300),
+                };
+            }
+            return { ok: true, value: r?.result?.value };
+        } catch (e: any) {
+            return { ok: false, error: String(e?.message || e) };
+        }
+    }
+
+    /** 确保扩展的 popup 世界存在（独立于 content 世界，避免顶层声明冲突），返回 contextId */
+    async ensurePopupWorld(ext: ICsExtInfo): Promise<number> {
+        let ctxId = this.popupWorlds.get(ext.electronId);
+        if (ctxId) return ctxId;
+        if (!this.alive || !this.frameId) throw new Error("CDP 会话未就绪");
+        const r: any = await this.send("Page.createIsolatedWorld", {
+            frameId: this.frameId,
+            worldName: POPUP_WORLD_PREFIX + ext.electronId,
+            grantUniversalAccess: true,
+            allowCommandLineAPI: false,
+        });
+        ctxId = r?.executionContextId;
+        if (!ctxId) throw new Error("createIsolatedWorld 未返回 contextId");
+        this.popupWorlds.set(ext.electronId, ctxId);
+        await this.send("Runtime.addBinding", { name: BRIDGE_NAME, executionContextId: ctxId });
+        const shim = buildShim(ext, this.host.messages(ext.path, ext.defaultLocale));
+        const sr: any = await this.send("Runtime.evaluate", { expression: shim, contextId: ctxId, returnByValue: false });
+        if (sr?.exceptionDetails) {
+            throw new Error("popup 垫片执行异常: " + String(sr.exceptionDetails?.exception?.description || sr.exceptionDetails?.text).slice(0, 200));
+        }
+        return ctxId;
     }
 
     private async evalInSw(ext: ICsExtInfo, expr: string): Promise<{ value?: any; err?: string }> {
@@ -522,6 +658,7 @@ function buildShim(ext: ICsExtInfo, messages: Record<string, any>): string {
         getURL: function (p) { return "chrome-extension://" + EXT.id + "/" + String(p || "").replace(/^\\//, ""); },
         onMessage: (function () {
             var fns = [];
+            self.__syCsOnMessageFns = fns;
             return {
                 addListener: function (fn) { if (typeof fn === "function") fns.push(fn); },
                 removeListener: function (fn) { var i = fns.indexOf(fn); if (i >= 0) fns.splice(i, 1); },
@@ -562,8 +699,16 @@ function buildShim(ext: ICsExtInfo, messages: Record<string, any>): string {
     };
     if (!chrome_.tabs) {
         chrome_.tabs = {
-            query: function (q, cb) { return cbStyle(Promise.resolve([]), cb); },
-            sendMessage: function () { return Promise.resolve(undefined); },
+            // popup 的"当前标签"就是它所在的页面
+            query: function (q, cb) {
+                var tab = { id: 1, index: 0, windowId: 1, active: true, highlighted: true, pinned: false, incognito: false, url: String(location.href), title: document.title };
+                return cbStyle(Promise.resolve([tab]), cb);
+            },
+            // 派发到本扩展 content 世界的 onMessage 监听器（宿主中转；SW↔CS 路由缺失的替代）
+            sendMessage: function (tabId, msg, cb) {
+                var p = hostCall("tabs-sendmessage", { tabId: typeof tabId === "number" ? tabId : null, msg: msg === undefined ? null : msg, senderUrl: String(location.href).slice(0, 300) });
+                return cbStyle(p, typeof cb === "function" ? cb : undefined);
+            },
         };
     }
     if (!chrome_.dom) chrome_.dom = {};
