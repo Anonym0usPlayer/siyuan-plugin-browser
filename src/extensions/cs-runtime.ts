@@ -483,9 +483,18 @@ class CsPageSession {
             }
             return { data: undefined };
         }
-        if (req.type === "sendmessage" || req.type === "portmessage") {
-            // portmessage：扩展用长连接端口取状态（如 AdGuard 的 Messenger），同样派发到 SW handlers
+        if (req.type === "sendmessage") {
             return await this.routeSendMessage(ext, args);
+        }
+        if (req.type === "portmessage") {
+            // portmessage：扩展用长连接端口取状态（AdGuard Messenger 等），
+            // 走 SW 垫片 v5 的 onConnect 端口语义（建连/复用 + outbox 回包）
+            return await this.routePortMessage(ext, args);
+        }
+        if (req.type === "tabevent") {
+            // popup 世界 tabs.query 时同步喂 SW 的 tab 注册表
+            // （AdGuard 的 tabsApi 靠 tabs 事件建 tabContext，Electron 下事件缺失）
+            return await this.feedTabEventToSw(ext, args);
         }
         if (req.type === "tabs-sendmessage") {
             // popup 世界 → content 世界的 onMessage 监听器（SW↔CS 路由缺失的替代）
@@ -549,8 +558,122 @@ class CsPageSession {
         }
     }
 
-    /** popup 世界 tabs.sendMessage → content 世界的 onMessage 监听器直调 */
-    private async dispatchToContentWorld(ext: ICsExtInfo, args: any): Promise<{ data?: any; err?: string }> {
+    /**
+     * popup 世界 port 消息 → SW onConnect 端口语义（SW 垫片 v5）。
+     * 首条消息建连：构造 port 对象派发给 __syOnConnectFns（扩展 handler 同步
+     * 注册 port.onMessage listeners）；随后 dispatch 消息并等待 outbox
+     * （handler 异步 port.postMessage 回包）带回响应。同一 portId 复用端口，
+     * 与真 Chrome 的 connect → postMessage 往返语义对齐。
+     */
+    private async routePortMessage(ext: ICsExtInfo, args: any): Promise<{ data?: any; err?: string }> {
+        const portId = String(args.portId || "p" + Date.now().toString(36));
+        const portName = String(args.portName || "");
+        const msgJson = JSON.stringify(args.msg === undefined ? null : args.msg);
+        const senderJson = JSON.stringify({ id: ext.electronId, url: String(args.senderUrl || "").slice(0, 300) });
+        const pidJson = JSON.stringify(portId);
+        const expr = `(async () => {
+            try {
+                self.__syPorts = self.__syPorts || {};
+                self.__syPortOutbox = self.__syPortOutbox || {};
+                var outbox = self.__syPortOutbox[${pidJson}];
+                var listeners = null;
+                var port = self.__syPorts[${pidJson}];
+                if (!port) {
+                    var fns = self.__syOnConnectFns || [];
+                    if (!fns.length) return JSON.stringify({ __noConnectHandlers: true });
+                    listeners = [];
+                    outbox = [];
+                    self.__syPortOutbox[${pidJson}] = outbox;
+                    port = {
+                        name: ${JSON.stringify(portName)},
+                        sender: ${senderJson},
+                        error: null,
+                        onMessage: {
+                            addListener: function (fn) { if (typeof fn === "function") listeners.push(fn); },
+                            removeListener: function (fn) { var i = listeners.indexOf(fn); if (i >= 0) listeners.splice(i, 1); },
+                            hasListener: function (fn) { return listeners.indexOf(fn) >= 0; },
+                        },
+                        onDisconnect: { addListener: function () {}, removeListener: function () {}, hasListener: function () { return false; } },
+                        postMessage: function (msg) { outbox.push(msg === undefined ? null : msg); },
+                        disconnect: function () { delete self.__syPorts[${pidJson}]; },
+                    };
+                    self.__syPorts[${pidJson}] = port;
+                    for (var i = 0; i < fns.length; i++) { try { fns[i](port); } catch (e) {} }
+                    if (!listeners.length) return JSON.stringify({ __noPortListeners: true });
+                } else {
+                    // 复用端口：从 port 对象恢复 listeners（垫片闭包不可达，存 port 上）
+                    listeners = port.__syListeners || [];
+                }
+                if (!port.__syListeners) port.__syListeners = listeners;
+                var m = ${msgJson};
+                var ls = listeners.slice();
+                for (var j = 0; j < ls.length; j++) { try { ls[j](m, port); } catch (e) {} }
+                // 等 handler 异步 postMessage 回包（同步回包在 dispatch 后立即就在 outbox）
+                var resp = await new Promise(function (resolve) {
+                    var n = 0;
+                    var t = setInterval(function () {
+                        if (outbox.length) {
+                            clearInterval(t);
+                            var arr = outbox.slice();
+                            outbox.length = 0;
+                            resolve(arr);
+                        } else if (++n > 200) {
+                            clearInterval(t);
+                            resolve([]);
+                        }
+                    }, 50);
+                });
+                return JSON.stringify(resp);
+            } catch (e) {
+                return JSON.stringify({ __portErr: String(e && e.message || e).slice(0, 200) });
+            }
+        })()`;
+        const r = await this.evalInSw(ext, expr);
+        if (r.err) return { err: r.err };
+        try {
+            const parsed = JSON.parse(String(r.value));
+            if (parsed && parsed.__noConnectHandlers) return { err: "扩展 SW 无 onConnect 处理器（垫片 v5 未生效？）" };
+            if (parsed && parsed.__noPortListeners) return { err: "扩展 SW onConnect 处理器未注册 port.onMessage 监听" };
+            if (parsed && parsed.__portErr) return { err: "port 路由异常: " + parsed.__portErr };
+            // parsed = 响应数组（可能多条）；空数组按无响应处理
+            if (Array.isArray(parsed)) {
+                return { data: parsed.length ? parsed : undefined };
+            }
+            return { data: parsed === null ? undefined : parsed };
+        } catch {
+            return { data: undefined };
+        }
+    }
+
+    /**
+     * 把"当前标签"喂进 SW 的 tab 注册表（垫片 v5 收集的 tabs 事件 listeners）。
+     * AdGuard 的 tabsApi 纯靠 tabs.onCreated/onUpdated 维护 tabContext Map，
+     * Electron 下事件缺失 → getTabContext 恒 undefined → popup 取状态静默失败。
+     * tabId 与垫片 tabs.query 返回的固定 id=1 对齐。
+     */
+    private async feedTabEventToSw(ext: ICsExtInfo, args: any): Promise<{ data?: any; err?: string }> {
+        const tabJson = JSON.stringify({
+            id: 1, index: 0, windowId: 1, active: true, highlighted: true, pinned: false,
+            incognito: false, url: String(args?.url || ""), title: String(args?.title || ""),
+        });
+        const expr = `(function () {
+            try {
+                var tab = ${tabJson};
+                var cfns = self.__syTabCreatedFns || [];
+                for (var i = 0; i < cfns.length; i++) { try { cfns[i](tab); } catch (e) {} }
+                var afns = self.__syTabActivatedFns || [];
+                for (var a = 0; a < afns.length; a++) { try { afns[a]({ tabId: tab.id, windowId: tab.windowId }); } catch (e) {} }
+                var ufns = self.__syTabUpdatedFns || [];
+                for (var j = 0; j < ufns.length; j++) { try { ufns[j](tab.id, { status: "complete", url: tab.url, title: tab.title }, tab); } catch (e) {} }
+            } catch (e) {}
+            return "ok";
+        })()`;
+        const r = await this.evalInSw(ext, expr);
+        if (r.err) return { err: r.err };
+        return { data: "ok" };
+    }
+
+    /** popup 世界 tabs.sendMessage → content 世界的 onMessage 监听器直调 */    private async dispatchToContentWorld(ext: ICsExtInfo, args: any): Promise<{ data?: any; err?: string }> {
         const ctxId = this.contentWorlds.get(ext.electronId);
         if (!ctxId) return { data: undefined }; // 内容世界未就绪（页面刚导航？）——按无接收方回调 undefined
         const msgJson = JSON.stringify(args.msg === undefined ? null : args.msg);
@@ -835,10 +958,12 @@ function buildShim(ext: ICsExtInfo, messages: Record<string, any>): string {
             var p = hostCall("sendmessage", { msg: msg === undefined ? null : msg, senderUrl: String(location.href).slice(0, 300) });
             return cbStyle(p, cb);
         },
-        // 长连接端口：postMessage 经宿主派发到 SW 的 onMessage 处理器，响应回传给端口监听器
-        // （空桩会让依赖端口取状态的扩展永远停在 loading 动画上）
+        // 长连接端口：postMessage 经宿主 routePortMessage 派发到 SW 的
+        // onConnect 端口处理器（垫片 v5），outbox 回包 dispatch 给本端监听器。
+        // portId 跨 postMessage 复用 —— 同一 connect 会话对应 SW 里同一个 port。
         connect: traced("runtime.connect", function (info) {
             var listeners = [];
+            var portId = "p" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
             var port = {
                 name: (info && info.name) || "",
                 sender: undefined,
@@ -851,8 +976,15 @@ function buildShim(ext: ICsExtInfo, messages: Record<string, any>): string {
                 },
                 onDisconnect: eventHub(),
                 postMessage: function (msg) {
-                    hostCall("portmessage", { msg: msg === undefined ? null : msg, senderUrl: String(location.href).slice(0, 300) }).then(function (resp) {
-                        if (resp !== undefined) {
+                    hostCall("portmessage", {
+                        portId: portId,
+                        portName: (info && info.name) || "",
+                        msg: msg === undefined ? null : msg,
+                        senderUrl: String(location.href).slice(0, 300),
+                    }).then(function (resp) {
+                        if (Array.isArray(resp)) {
+                            resp.forEach(function (item) { port.onMessage.dispatch(item); });
+                        } else if (resp !== undefined) {
                             port.onMessage.dispatch(resp);
                         }
                     }).catch(function () {});
@@ -937,6 +1069,10 @@ function buildShim(ext: ICsExtInfo, messages: Record<string, any>): string {
             // popup 的"当前标签"就是它所在的页面
             query: function (q, cb) {
                 var tab = { id: 1, index: 0, windowId: 1, active: true, highlighted: true, pinned: false, incognito: false, url: String(location.href), title: document.title };
+                // 顺手把该 tab 喂进 SW 的 tab 注册表（tabevent 通道）——
+                // AdGuard 的 tabsApi 靠 tabs 事件建 tabContext，Electron 下事件
+                // 缺失，不喂的话 getTabContext 恒 undefined → popup 卡 loading
+                try { hostCall("tabevent", { url: tab.url, title: tab.title }).catch(function () {}); } catch (e) {}
                 return cbStyle(Promise.resolve([tab]), cb);
             },
             // 派发到本扩展 content 世界的 onMessage 监听器（宿主中转；SW↔CS 路由缺失的替代）

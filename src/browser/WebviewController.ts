@@ -163,10 +163,13 @@ export class WebviewController {
             this.maybeRecordHistory(url);
         });
         this.on("dom-ready", () => {
-            // 每次页面导航完成后触发：Chrome 扩展内容脚本在此注入
+            // 每次页面导航完成后触发：Chrome 扩展内容脚本在此注入。
+            // chrome-extension:// 页面（整页打开的扩展 popup/options）也要通知 ——
+            // 它们需要宿主注入扩展专属世界垫片，此前被 http(s) 过滤掉导致
+            // 页面脚本跑在 Electron 原生受限主世界里卡死在 loading。
             try {
                 const url = this.webview.getURL?.() || "";
-                if (/^https?:\/\//i.test(url)) {
+                if (/^(https?:|chrome-extension:)\/\//i.test(url)) {
                     this.onDomReady?.(this.webview, url);
                 }
             } catch {}

@@ -13,7 +13,7 @@ import { EDGE_UA } from "../extensions/edgeStore";
 import { isEdgeAddonsSiteUrl } from "../extensions/edgeStoreHelper";
 import { BROWSER_PARTITION } from "../constants";
 import { remoteSession } from "../utils/electron";
-import { showExtensionPopupInPage, closeExtensionPopupInPage } from "./ext-popup";
+import { showExtensionPopupInPage, closeExtensionPopupInPage, injectExtensionPageRuntime } from "./ext-popup";
 import { listExtensionMenuItems, evalInExtensionWorld } from "../extensions/sw-bridge";
 import { beginPopupWorld, evalPopupJs } from "../extensions/cs-runtime";
 import { POPUP_JS_PRELUDE } from "./ext-popup";
@@ -200,10 +200,12 @@ export class BrowserTab {
 
         this.controller.attach();
 
-        // Chrome 扩展内容脚本注入（每次页面导航完成后由 dom-ready 触发）
-        if (deps.injectExtensions) {
-            this.controller.onDomReady = (wv, url) => deps.injectExtensions!(wv, url);
-        }
+        // Chrome 扩展内容脚本注入（每次页面导航完成后由 dom-ready 触发）；
+        // chrome-extension:// 整页（扩展 popup/options）另走垫片注入
+        this.controller.onDomReady = (wv, url) => {
+            deps.injectExtensions?.(wv, url);
+            void this.maybeInjectExtensionPage(url);
+        };
 
         // 启动 webview 健康监测：思源分屏/拖动页签会搬移 panelElement，
         // Electron webview 被重新挂载后 guest 即损坏（白屏且无响应），需自动重建
@@ -495,6 +497,57 @@ export class BrowserTab {
         });
         if (!out.ok) {
             showMessage(`打开「${ext.name}」面板失败: ${out.error}`, 5000, "error");
+        }
+    }
+
+    /**
+     * webview 导航到本插件管理的 chrome-extension:// 页面时（如从思源顶栏
+     * 无浏览器 tab 场景 openUrl 直开的扩展 popup/options），注入扩展专属
+     * 世界垫片并重放页面脚本 —— 否则页面脚本跑在 Electron 原生受限主世界，
+     * sendMessage/storage 全部失败，AdGuard 等会永远停在 loading 动画。
+     */
+    private async maybeInjectExtensionPage(url: string): Promise<void> {
+        try {
+            if (!url || !/^chrome-extension:\/\//i.test(url)) return;
+            const m = url.match(/^chrome-extension:\/\/([^/?#\s]+)(\/[^?#]*)?/i);
+            if (!m) return;
+            const electronId = m[1];
+            const pagePath = (m[2] || "/").slice(1);
+            if (!pagePath) return;
+            const host = (window as any).browserPlugin?.extensionHost;
+            const ext = host?.list?.().find((e: any) => e.electronId === electronId && e.native);
+            if (!ext) return; // 非本插件管理的扩展（或未原生加载）—— 交给 Electron 原生
+            const extInfo = {
+                electronId: ext.electronId,
+                path: ext.path,
+                name: ext.name,
+                version: ext.version,
+                defaultLocale: ext.defaultLocale,
+                contentScripts: ext.contentScripts,
+            };
+            const out = await injectExtensionPageRuntime({
+                webview: this.webview,
+                extPath: ext.path,
+                electronId: ext.electronId,
+                pagePath,
+                begin: () => beginPopupWorld(this.webview, extInfo),
+                evalJs: (src, relPath) => {
+                    const fakeUrl = "chrome-extension://" + ext.electronId + "/" + String(relPath).replace(/^\.\//, "");
+                    const prefixed =
+                        "self.__sySetCurrentScript && self.__sySetCurrentScript(" + JSON.stringify(fakeUrl) + ");\n" + src;
+                    return evalPopupJs(this.webview, extInfo, prefixed).then((rr) => {
+                        if (!rr.ok) throw new Error(rr.error);
+                        return rr.value;
+                    });
+                },
+            });
+            if (!out.ok) {
+                console.warn("[browser-plugin] 扩展页面垫片注入失败(" + pagePath + "):", out.error);
+            } else {
+                console.log("[browser-plugin] 扩展页面垫片已注入:", pagePath, "scripts:", out.scripts);
+            }
+        } catch (e) {
+            console.warn("[browser-plugin] maybeInjectExtensionPage failed:", e);
         }
     }
 

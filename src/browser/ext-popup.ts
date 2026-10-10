@@ -406,3 +406,75 @@ export async function closeExtensionPopupInPage(webview: IWebviewTag): Promise<v
         );
     } catch {}
 }
+
+/**
+ * 整页打开扩展页面（chrome-extension://...）时的垫片注入。
+ *
+ * 与 showExtensionPopupInPage（页内弹出）不同：页面 DOM 与 <link> 样式已由
+ * webview 原生加载完毕，无需重建 DOM / 重写 CSS。缺的只是 chrome.* 运行时：
+ * 主世界里 Electron 原生绑定的 API 受限（storage.sync 抛错、sendMessage 报
+ * "Receiving end does not exist"），页面脚本跑一遍就死在 loading 动画上。
+ * 因此只需：(1) begin() 新建扩展专属世界装垫片；(2) 把页面引用的脚本在该
+ * 世界按 HTML 顺序重放（逐文件伪造 currentScript，webpack/rspack 的
+ * publicPath 检测依赖它）。
+ * PRELUDE 的 body 挂载重定向在本场景安全复用 —— 无 #sy-ext-popup-host 时
+ * 全部透传真实 body。
+ *
+ * @param pagePath URL path（不含 query/hash），如 "pages/popup.html"
+ */
+export async function injectExtensionPageRuntime(opts: {
+    webview: IWebviewTag;
+    extPath: string;
+    electronId: string;
+    pagePath: string;
+    /** 开始一次扩展世界会话（新建世界装垫片）—— 在首个脚本执行前调用一次 */
+    begin?: () => Promise<void>;
+    /** 逐文件执行通道（扩展专属世界） */
+    evalJs?: (src: string, relPath: string) => Promise<any>;
+}): Promise<{ ok: boolean; error?: string; scripts?: number }> {
+    const { webview, extPath, electronId, pagePath } = opts;
+    try {
+        const { fs, path } = nodeMods();
+        const pageRel = decodeURIComponent(pagePath || "index.html");
+        const html = readText(fs, path.join(extPath, pageRel));
+        if (!html) return { ok: false, error: "页面文件不存在: " + pageRel };
+
+        // 相对页面所在目录解析脚本（../ 回退由 path.join 正规化吸收）
+        const baseDir = path.dirname(pageRel).replace(/\\/g, "/");
+        const resolveRel = (rel: string): string => {
+            if (/^(https?:|data:|chrome-extension:)/i.test(rel)) return rel;
+            const norm = rel.replace(/^\.\//, "");
+            return baseDir && baseDir !== "." ? `${baseDir}/${norm}` : norm;
+        };
+        const scriptSrcs = collectScriptSrcs(html).map(resolveRel);
+
+        const jsSources: string[] = [];
+        for (const rel of scriptSrcs) {
+            if (/^(https?:|data:|chrome-extension:)/i.test(rel)) continue;
+            const js = readText(fs, path.join(extPath, rel));
+            if (js) jsSources.push(rewriteUrls(js, electronId));
+        }
+
+        if (typeof opts.evalJs !== "function") {
+            return { ok: false, error: "未提供 evalJs 通道（主世界无可用 chrome.*）" };
+        }
+
+        // 主世界已跑过一遍页面脚本（Electron 原生受限 chrome.*，半死状态），
+        // 先清掉它渲染的挂载点内容，避免隔离世界重放后出现双份 UI
+        try {
+            await webview.executeJavaScript(
+                "try { ['root','root-portal'].forEach(function (id) { var n = document.getElementById(id); if (n) n.innerHTML = ''; }); } catch (e) {} true",
+                false,
+            );
+        } catch {}
+
+        if (opts.begin) await opts.begin();
+        await opts.evalJs(POPUP_JS_PRELUDE, "__prelude__");
+        for (let i = 0; i < jsSources.length; i++) {
+            await opts.evalJs(jsSources[i], scriptSrcs[i]);
+        }
+        return { ok: true, scripts: jsSources.length };
+    } catch (e: any) {
+        return { ok: false, error: String(e?.message || e).slice(0, 300) };
+    }
+}

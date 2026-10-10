@@ -176,7 +176,7 @@ export class ExtensionHost {
      */
     private injectBackgroundShims(): void {
         const { fs, path } = nodeModules();
-        const SHIM_MARK = "/* sy-bg-shim:v4 */";
+        const SHIM_MARK = "/* sy-bg-shim:v12 */";
         let changedShimCount = 0;
         for (const ext of this.extensions) {
             try {
@@ -216,6 +216,47 @@ export class ExtensionHost {
                 chrome[ns][ev] = eventHub();
             });
         });
+        // 引擎拦截链需要 webRequest/webNavigation 的**全套请求事件**
+        // （v4 空壳只补了 5 个通用事件 → AdGuard engine 启动报 .addListener undefined）
+        try {
+            var REQ_EVENTS = ["onBeforeRequest", "onBeforeSendHeaders", "onSendHeaders", "onHeadersReceived",
+                "onAuthRequired", "onResponseStarted", "onBeforeRedirect", "onCompleted", "onErrorOccurred"];
+            var NAV_EVENTS = ["onBeforeNavigate", "onCommitted", "onDOMContentLoaded", "onCompleted",
+                "onErrorOccurred", "onCreatedNavigationTarget", "onReferenceFragmentUpdated",
+                "onTabReplaced", "onHistoryStateUpdated", "onDomainChanged"];
+            ["webRequest", "declarativeNetRequest"].forEach(function (ns) {
+                if (!chrome[ns]) chrome[ns] = {};
+                REQ_EVENTS.forEach(function (ev) {
+                    if (!chrome[ns][ev] || typeof chrome[ns][ev].addListener !== "function") chrome[ns][ev] = eventHub();
+                });
+            });
+            if (!chrome.webNavigation) chrome.webNavigation = {};
+            NAV_EVENTS.forEach(function (ev) {
+                if (!chrome.webNavigation[ev] || typeof chrome.webNavigation[ev].addListener !== "function") chrome.webNavigation[ev] = eventHub();
+            });
+            // privacy 壳（AdGuard StealthService 调 privacy.network.webRTCIPHandlingPolicy）
+            if (!chrome.privacy) chrome.privacy = {};
+            if (!chrome.privacy.network) chrome.privacy.network = {};
+            ["webRTCIPHandlingPolicy", "networkPredictionEnabled"].forEach(function (k) {
+                if (!chrome.privacy.network[k]) chrome.privacy.network[k] = {
+                    get: function (d, cb) { var v = { value: "default" }; if (typeof cb === "function") { try { cb(v); } catch (e) {} } return Promise.resolve(v); },
+                    set: function (d, cb) { if (typeof cb === "function") { try { cb(); } catch (e) {} } return Promise.resolve(); },
+                    clear: function (d, cb) { if (typeof cb === "function") { try { cb(); } catch (e) {} } return Promise.resolve(); },
+                };
+            });
+            if (!chrome.webNavigation.getAllFrames) chrome.webNavigation.getAllFrames = function (opts, cb) { var v = []; if (typeof cb === "function") { try { cb(v); } catch (e) {} } return Promise.resolve(v); };
+        } catch (e) {}
+        // 6) 给 webextension-polyfill 的 browser 对象补 webNavigation：
+        //    polyfill 的 schema 天生不含 webNavigation（AdGuard 代码却引用
+        //    browser.webNavigation.*），垫片执行时 polyfill 尚未构建，故延迟一拍
+        //    注入 —— 晚于 polyfill 构建、早于 engine.start 的异步流程。
+        setTimeout(function () {
+            try {
+                if (typeof browser !== "undefined" && browser && !browser.webNavigation && chrome.webNavigation) {
+                    browser.webNavigation = chrome.webNavigation;
+                }
+            } catch (e) {}
+        }, 0);
         // commands 补 API 形态（manifest 里声明的快捷键注册）
         if (chrome.commands && !chrome.commands.getAll) {
             chrome.commands.getAll = function (cb) { cb && cb([]); };
@@ -313,6 +354,68 @@ export class ExtensionHost {
                         } catch (e) {}
                     });
                 }
+            }
+        } catch (e) {}
+        // 4) runtime.onConnect 端口语义（AdGuard 等经 port 与 SW 通信取状态）：
+        //    Electron 没实现扩展间 port 路由。这里收集 onConnect listeners；
+        //    宿主（cs-runtime routePortMessage）经 CDP 建连时构造 port 对象派发，
+        //    port.postMessage 写入 outbox、由宿主轮询带回页面世界。
+        try {
+            if (chrome.runtime && chrome.runtime.onConnect && !chrome.runtime.onConnect.__syWrapped) {
+                var ocFns = [];
+                var ocWrapped = {
+                    addListener: function (fn) { if (typeof fn === "function") ocFns.push(fn); },
+                    removeListener: function (fn) { var i = ocFns.indexOf(fn); if (i >= 0) ocFns.splice(i, 1); },
+                };
+                Object.defineProperty(chrome.runtime, "onConnect", {
+                    configurable: true,
+                    get: function () { return ocWrapped; },
+                });
+                ocWrapped.__syWrapped = true;
+                self.__syOnConnectFns = ocFns;
+                self.__syPorts = self.__syPorts || {};
+                self.__syPortOutbox = self.__syPortOutbox || {};
+            }
+        } catch (e) {}
+        // 5) chrome.tabs 事件收集（AdGuard 等靠 onCreated/onUpdated 维护 tabContext，
+        //    Electron SW 里这些事件永不触发 → 扩展取 tab 状态时 getTabContext 恒
+        //    undefined → popup 卡 loading）。宿主经 "tabevent" 通道手工喂 tab。
+        try {
+            if (chrome.tabs && !chrome.tabs.__syTabWrapped) {
+                // 5a) tabs API 补桩：Electron 原生 tabs 缺 create/update/remove 等，
+                //     AdGuard onInstalled 流程调 tabs.create 直接 TypeError →
+                //     初始化链中断（tabsApi.start 永不执行 → popup 取状态卡 loading）
+                if (!chrome.tabs.create) chrome.tabs.create = function (props, cb) { var t = { id: 1, index: 0, windowId: 1, active: true, url: (props && props.url) || "" }; if (typeof cb === "function") { try { cb(t); } catch (e) {} } return Promise.resolve(t); };
+                if (!chrome.tabs.update) chrome.tabs.update = function (id, props, cb) { var t = { id: typeof id === "number" ? id : 1, url: (props && props.url) || "" }; if (typeof cb === "function") { try { cb(t); } catch (e) {} } return Promise.resolve(t); };
+                if (!chrome.tabs.remove) chrome.tabs.remove = function (id, cb) { if (typeof cb === "function") { try { cb(); } catch (e) {} } return Promise.resolve(); };
+                if (!chrome.tabs.get) chrome.tabs.get = function (id, cb) { var t = { id: id, index: 0, windowId: 1, active: false, url: "" }; if (typeof cb === "function") { try { cb(t); } catch (e) {} } return Promise.resolve(t); };
+                if (!chrome.tabs.reload) chrome.tabs.reload = function (id, cb) { if (typeof cb === "function") { try { cb(); } catch (e) {} } return Promise.resolve(); };
+                if (chrome.tabs.TAB_ID_NONE === undefined) chrome.tabs.TAB_ID_NONE = -1;
+                // 5c) permissions API 补桩：AdGuard 引擎启动链调 permissions.contains
+                //     （Electron 原生缺失 → "Cannot be started"）。MV3 所需权限默认放行。
+                if (chrome.permissions) {
+                    if (!chrome.permissions.contains) chrome.permissions.contains = function (perms, cb) { var v = true; if (typeof cb === "function") { try { cb(v); } catch (e) {} } return Promise.resolve(v); };
+                    if (!chrome.permissions.request) chrome.permissions.request = function (perms, cb) { var v = true; if (typeof cb === "function") { try { cb(v); } catch (e) {} } return Promise.resolve(v); };
+                    if (!chrome.permissions.remove) chrome.permissions.remove = function (perms, cb) { var v = true; if (typeof cb === "function") { try { cb(v); } catch (e) {} } return Promise.resolve(v); };
+                    if (!chrome.permissions.getAll) chrome.permissions.getAll = function (cb) { var v = { origins: [], permissions: [] }; if (typeof cb === "function") { try { cb(v); } catch (e) {} } return Promise.resolve(v); };
+                }
+                // 5b) tabs 事件收集（AdGuard 等靠 onCreated/onUpdated 维护 tabContext，
+                //     Electron SW 里这些事件永不触发 → 宿主经 "tabevent" 通道手工喂 tab）
+                var tcFns = [], tuFns = [], taFns = [];
+                var tabEvFor = function (fns) {
+                    return {
+                        addListener: function (fn) { if (typeof fn === "function") fns.push(fn); },
+                        removeListener: function (fn) { var i = fns.indexOf(fn); if (i >= 0) fns.splice(i, 1); },
+                        hasListener: function (fn) { return fns.indexOf(fn) >= 0; },
+                    };
+                };
+                try { Object.defineProperty(chrome.tabs, "onCreated", { configurable: true, get: function () { return tabEvFor(tcFns); } }); } catch (e) { chrome.tabs.onCreated = tabEvFor(tcFns); }
+                try { Object.defineProperty(chrome.tabs, "onUpdated", { configurable: true, get: function () { return tabEvFor(tuFns); } }); } catch (e) { chrome.tabs.onUpdated = tabEvFor(tuFns); }
+                try { Object.defineProperty(chrome.tabs, "onActivated", { configurable: true, get: function () { return tabEvFor(taFns); } }); } catch (e) { chrome.tabs.onActivated = tabEvFor(taFns); }
+                chrome.tabs.__syTabWrapped = true;
+                self.__syTabCreatedFns = tcFns;
+                self.__syTabUpdatedFns = tuFns;
+                self.__syTabActivatedFns = taFns;
             }
         } catch (e) {}
     } catch (e) {}
