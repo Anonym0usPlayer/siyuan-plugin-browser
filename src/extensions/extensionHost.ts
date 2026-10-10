@@ -2,6 +2,7 @@ import { Dialog, showMessage } from "siyuan";
 import type { IWebviewTag } from "../types";
 import { parseExtensionPackage } from "./crx";
 import { EDGE_ADDONS_HOME, downloadEdgeCrx, fetchEdgeAddonMeta, parseEdgeAddonId } from "./edgeStore";
+import { disposeCsRuntime, ensureCsRuntime, initCsRuntime } from "./cs-runtime";
 import { remoteSession } from "../utils/electron";
 
 /**
@@ -900,6 +901,75 @@ export class ExtensionHost {
         } else {
             window.open(EDGE_ADDONS_HOME, "_blank");
         }
+    }
+
+    // ===== 内容脚本 chrome.* 真实绑定（cs-runtime.ts 的宿主能力提供者） =====
+
+    private csRuntimeInited = false;
+
+    /** dom-ready 时调用：确保该页签的 CDP 会话与各扩展自建世界就绪 */
+    ensureCsRuntime(webview: IWebviewTag): void {
+        try {
+            if (!this.csRuntimeInited) {
+                initCsRuntime({
+                    listNativeExts: () =>
+                        this.extensions
+                            .filter((e) => e.enabled && e.native && !!e.electronId)
+                            .map((e) => ({
+                                electronId: e.electronId!,
+                                path: e.path,
+                                name: e.name,
+                                version: e.version,
+                                defaultLocale: e.defaultLocale,
+                                contentScripts: e.contentScripts,
+                            })),
+                    readFile: (extPath: string, rel: string) => {
+                        const { fs, path } = nodeModules();
+                        return fs.readFileSync(path.join(extPath, rel), "utf8");
+                    },
+                    messages: (extPath: string, defaultLocale: string) => {
+                        for (const locale of [defaultLocale, "en", "zh_CN"].filter(Boolean)) {
+                            try {
+                                return JSON.parse(this.readFileCached(extPath, `_locales/${locale}/messages.json`));
+                            } catch {}
+                        }
+                        return {};
+                    },
+                    wakeOne: async (electronId: string) => {
+                        const ses = remoteSession();
+                        if (!ses) return null;
+                        const ext = this.extensions.find((e) => e.electronId === electronId);
+                        if (!ext) return null;
+                        try {
+                            ses.removeExtension(electronId);
+                        } catch {}
+                        try {
+                            const info = await ses.loadExtension(ext.path, { allowFileAccess: true });
+                            if (info?.id && info.id !== electronId) {
+                                // Electron 的扩展 id 与 SW origin 可能跨 load 变化 —— 同步回列表
+                                ext.electronId = info.id;
+                                ext.native = true;
+                                await this.persist();
+                                return info.id;
+                            }
+                            return electronId;
+                        } catch {
+                            return null;
+                        }
+                    },
+                });
+                this.csRuntimeInited = true;
+            }
+            ensureCsRuntime(webview);
+        } catch (e) {
+            console.warn("[browser-plugin] ensureCsRuntime failed:", e);
+        }
+    }
+
+    disposeCsRuntime(webview: IWebviewTag): void {
+        try {
+            disposeCsRuntime(webview);
+        } catch {}
     }
 
     /** 扩展管理对话框 */

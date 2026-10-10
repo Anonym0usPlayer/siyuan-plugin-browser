@@ -14,7 +14,7 @@ import { isEdgeAddonsSiteUrl } from "../extensions/edgeStoreHelper";
 import { BROWSER_PARTITION } from "../constants";
 import { remoteSession } from "../utils/electron";
 import { showExtensionPopupInPage, closeExtensionPopupInPage } from "./ext-popup";
-import { listExtensionMenuItems, installMessageRouteShim, evalInExtensionWorld } from "../extensions/sw-bridge";
+import { listExtensionMenuItems, evalInExtensionWorld } from "../extensions/sw-bridge";
 import type { IExtensionMenuItem } from "./contextMenu";
 
 /** 图标文件 → data URL 缓存（key 为 path+相对路径；读失败/非图片返回 undefined 且不缓存） */
@@ -203,21 +203,12 @@ export class BrowserTab {
         this.controller.setExtensionMenuSource(
             () => this.getExtMenuItems(),
             (item) => {
-                // 扩展 contextMenus 项 → 走思源自己的消息路由（两段式）：
-                // 1) installMessageRouteShim：在该扩展的 isolated world 里把
-                //    chrome.runtime.sendMessage 替换为 storage 桥（__syRouteIn/
-                //    __syRouteResp_<id>），与 SW 垫片 v4 的 onMessage 路由配对 ——
-                //    通用修复 CS→SW 方向（剪藏提交的 check-kernel/upload-copy
-                //    依赖它，其他扩展同样受益）。
-                // 2) evalInExtensionWorld：CDP 直达 content script 世界，调它
-                //    暴露的全局分发函数（SiYuan Clip：eventDispatcher）——
-                //    绕过 Electron 缺失的 SW→CS tabs.sendMessage 路由。
+                // 扩展 contextMenus 项 → 直调扩展在自建世界（cs-runtime.ts）里的
+                // 全局分发函数（SiYuan Clip：eventDispatcher）。自建世界的
+                // chrome.runtime.sendMessage 已由宿主桥接到 SW 垫片 v4 路由，
+                // 无需再装消息桥（installMessageRouteShim 仅剩 Electron 原生
+                // 空壳世界可落点，已废弃）。
                 void (async () => {
-                    const shim = await installMessageRouteShim(this.webview, item.electronId);
-                    if (!shim.ok) {
-                        showMessage(`消息桥安装失败: ${shim.error}`, 5000, "error");
-                        return;
-                    }
                     const isSend = item.id === "send";
                     const msg = isSend
                         ? { func: "siyuanGetReadability", tabId: 0 }
@@ -825,6 +816,9 @@ export class BrowserTab {
             clearInterval(this.healthTimer);
             this.healthTimer = null;
         }
+        try {
+            (window as any).browserPlugin?.extensionHost?.disposeCsRuntime?.(this.webview);
+        } catch {}
         this.controller.dispose();
         this.element.remove();
     }

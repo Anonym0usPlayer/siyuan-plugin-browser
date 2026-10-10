@@ -136,6 +136,11 @@ export default class BrowserPlugin extends Plugin {
                             } catch (e) {
                                 console.warn("[browser-plugin] inject edge store helper failed:", e);
                             }
+                            try {
+                                plugin.extensionHost?.ensureCsRuntime?.(webview);
+                            } catch (e) {
+                                console.warn("[browser-plugin] ensure cs-runtime failed:", e);
+                            }
                         },
                         installEdgeExtension: (id: string, source: string) => {
                             return plugin.extensionHost.installFromEdgeAddons(id).then((r) => {
