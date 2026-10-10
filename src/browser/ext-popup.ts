@@ -343,12 +343,18 @@ export async function showExtensionPopupInPage(opts: {
         const r = await webview.executeJavaScript(runner, false);
         if (r !== true) return { ok: false, error: "popup 注入失败" };
         if (useEvalJs) {
-            for (const src of jsSources) {
-                try {
-                    await opts.evalJs!(src);
-                } catch (e: any) {
-                    return { ok: false, error: "popup 脚本执行失败: " + String(e?.message || e).slice(0, 200) };
-                }
+            // 所有脚本打包进单个 IIFE：文件间共享顶层声明（lib 的 const 对 popup.js
+            // 可见），且每次打开都是全新闭包 —— 世界复用时重开不会再撞
+            // "Identifier has already been declared"
+            const bundle =
+                POPUP_JS_PRELUDE +
+                "\n;(function(){\n" +
+                jsSources.join("\n;\n") +
+                "\n})();";
+            try {
+                await opts.evalJs(bundle);
+            } catch (e: any) {
+                return { ok: false, error: "popup 脚本执行失败: " + String(e?.message || e).slice(0, 200) };
             }
         }
         return { ok: true };
