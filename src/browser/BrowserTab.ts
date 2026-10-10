@@ -304,32 +304,39 @@ export class BrowserTab {
     private registerWebRequest(session: any): void {
         // 1. 响应头：移除站点安全限制（CSP / X-Frame-Options）
         session.webRequest.onHeadersReceived((details: any, cb: (r: any) => void) => {
-            const headers: Record<string, string> = {};
-            if (details?.responseHeaders) {
-                for (const key of Object.keys(details.responseHeaders)) {
-                    headers[key.toLowerCase()] = details.responseHeaders[key];
+            try {
+                // Electron 的 responseHeaders 是 Record<string, string[]>；
+                // 之前把值再包一层数组 → 嵌套数组（Set-Cookie 等多值头被写坏，
+                // cookie 反复累积后请求头爆掉 → IIS 400 "Header Field Too Long"）
+                const out: Record<string, string[]> = {};
+                if (details?.responseHeaders) {
+                    for (const key of Object.keys(details.responseHeaders)) {
+                        const lower = key.toLowerCase();
+                        if (lower === "content-security-policy"
+                            || lower === "content-security-policy-report-only"
+                            || lower === "x-frame-options") continue;
+                        const v = details.responseHeaders[key];
+                        out[key] = Array.isArray(v) ? v : [String(v)];
+                    }
                 }
+                cb({ responseHeaders: out });
+            } catch {
+                cb({});
             }
-            delete headers["content-security-policy"];
-            delete headers["content-security-policy-report-only"];
-            delete headers["x-frame-options"];
-            const out: Record<string, string[]> = {};
-            for (const k in headers) out[k] = [headers[k]];
-            cb({ responseHeaders: out });
         });
         // 2. 请求头：为出站请求注入 Referer，绕过 CDN 防盗链
         //    站点 CDN 检测到空 Referer 会返回 403（X-Error-Info: EmptyReferer）
         session.webRequest.onBeforeSendHeaders((details: any, cb: (r: any) => void) => {
             const reqUrl = details.url || "";
             if (!/^https?:\/\//i.test(reqUrl)) {
-                cb({ requestHeaders: details.requestHeaders });
+                cb({});
                 return;
             }
             try {
                 const referrer = details.referrer || "";
                 // 已有合法 http(s) referer → 不改
                 if (referrer && /^https?:\/\//i.test(referrer)) {
-                    cb({ requestHeaders: details.requestHeaders });
+                    cb({});
                     return;
                 }
                 // 用当前 webview URL 作为 Referer
@@ -342,11 +349,18 @@ export class BrowserTab {
                     const target = new URL(reqUrl);
                     refUrl = target.origin + "/";
                 }
-                const headers = { ...details.requestHeaders };
+                // requestHeaders 应为 Record<string, string>，值一律归一为字符串
+                const headers: Record<string, string> = {};
+                if (details?.requestHeaders) {
+                    for (const k of Object.keys(details.requestHeaders)) {
+                        const v = details.requestHeaders[k];
+                        headers[k] = Array.isArray(v) ? String(v[0]) : String(v);
+                    }
+                }
                 headers["Referer"] = refUrl;
                 cb({ requestHeaders: headers });
             } catch {
-                cb({ requestHeaders: details.requestHeaders });
+                cb({});
             }
         });
         console.log("[browser-plugin] webRequest registered (CSP strip + referer inject)");
