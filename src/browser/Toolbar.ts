@@ -20,6 +20,20 @@ export interface ToolbarCallbacks {
     onAction(action: ToolbarAction, payload?: any): void;
     onUrlSubmit(url: string): void;
     onFindInPage(text: string): void;
+    /** 点击扩展图标（anchor 用于弹出面板定位） */
+    onExtensionIcon?(extId: string, anchor: HTMLElement): void;
+}
+
+/** 工具栏扩展图标项 */
+export interface IToolbarExtIcon {
+    /** 扩展记录 id（openExtensionPopup 用） */
+    id: string;
+    /** 悬停提示 */
+    title: string;
+    /** 图标 data URL（无图标时为空，渲染首字母兜底） */
+    iconDataUrl: string;
+    /** 无图标时的首字母兜底 */
+    letter: string;
 }
 
 /** 工具栏 UI */
@@ -68,6 +82,7 @@ export class Toolbar {
                 <button class="sy-browser-btn" data-act="bookmark" title="${this.i18n.addBookmark}">☆</button>
                 <button class="sy-browser-btn" data-act="find" title="${this.i18n.findInPage}">🔍</button>
                 <button class="sy-browser-btn" data-act="openExternal" title="${this.i18n.openExternal}">↗</button>
+                <div class="sy-browser-extbar"></div>
             </div>
             <div class="sy-browser-findbar-wrap" style="display:none;">
                 <input class="sy-browser-findbar" type="text" placeholder="${this.i18n.findInPage}" spellcheck="false" />
@@ -122,6 +137,12 @@ export class Toolbar {
                     this.cb.onAction("openExternal");
                     break;
             }
+        });
+        // 扩展图标点击（独立于 data-act 体系，extId 从 dataset 取）
+        this.element.addEventListener("click", (e) => {
+            const btn = (e.target as HTMLElement).closest("[data-ext-id]") as HTMLElement | null;
+            if (!btn || !this.cb.onExtensionIcon) return;
+            this.cb.onExtensionIcon(btn.dataset.extId!, btn);
         });
 
         this.urlbar.addEventListener("keydown", (e) => {
@@ -207,6 +228,28 @@ export class Toolbar {
     focusUrl(): void {
         this.urlbar.focus();
         this.urlbar.select();
+    }
+
+    /** 渲染扩展图标区（地址栏旁）；空列表时整个区域隐藏（:empty 样式） */
+    setExtensionIcons(items: IToolbarExtIcon[]): void {
+        const bar = this.element.querySelector(".sy-browser-extbar") as HTMLElement | null;
+        if (!bar) return;
+        bar.innerHTML = "";
+        for (const it of items) {
+            const btn = document.createElement("button");
+            btn.className = "sy-browser-extbtn";
+            btn.dataset.extId = it.id;
+            btn.title = it.title;
+            if (it.iconDataUrl) {
+                const img = document.createElement("img");
+                img.src = it.iconDataUrl;
+                img.alt = it.title;
+                btn.appendChild(img);
+            } else {
+                btn.textContent = it.letter;
+            }
+            bar.appendChild(btn);
+        }
     }
 
     get urlbarElement(): HTMLInputElement {

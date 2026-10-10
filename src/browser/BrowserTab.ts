@@ -72,6 +72,7 @@ export class BrowserTab {
             onAction: (action, payload) => this.onToolbarAction(action, payload),
             onUrlSubmit: (url) => this.controller.loadURL(url),
             onFindInPage: (text) => this.controller.findInPage(text),
+            onExtensionIcon: (extId, anchor) => void this.openExtensionPopup(extId, anchor),
         }, this.settings);
         this.controller = new WebviewController(this.webview, {
             settings: this.settings,
@@ -215,6 +216,52 @@ export class BrowserTab {
         // 异步初始化：先确保 preload 路径就绪，再加载初始 URL
         // preload 必须在 webview 第一次加载前设置，否则不生效
         this.init(initialUrl);
+
+        // 地址栏旁的扩展图标区：初始刷一次，扩展宿主数据就绪后再刷
+        this.onExtHostLoaded = () => void this.refreshExtensionIcons();
+        window.addEventListener("sy-browser-ext-host-loaded", this.onExtHostLoaded);
+        this.refreshExtensionIcons();
+    }
+
+    private onExtHostLoaded: (() => void) | null = null;
+
+    /**
+     * 刷新工具栏扩展图标区：列出已启用且有 popup 的扩展。
+     * 图标从扩展目录读文件转 data URL —— 主窗口是 https 页，img 直接引用
+     * file:// 会被混合内容策略拦掉。
+     */
+    private refreshExtensionIcons(): void {
+        try {
+            const host = (window as any).browserPlugin?.extensionHost;
+            const list = host?.listActionable?.() || [];
+            const req = (window as any).require;
+            const fs = req("fs");
+            const path = req("path");
+            const MIME: Record<string, string> = {
+                ".png": "image/png", ".svg": "image/svg+xml", ".ico": "image/x-icon",
+                ".bmp": "image/bmp", ".webp": "image/webp", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+            };
+            const items = list.map((ext: any) => {
+                let iconDataUrl = "";
+                try {
+                    if (ext.iconPath) {
+                        const buf = fs.readFileSync(path.join(ext.path, ext.iconPath));
+                        const mime = MIME[String(ext.iconPath).toLowerCase().replace(/^.*(\.[a-z0-9]+)$/, "$1")] || "image/png";
+                        iconDataUrl = `data:${mime};base64,` + buf.toString("base64");
+                    }
+                } catch {}
+                return {
+                    id: String(ext.id),
+                    // actionTitle 可能还是 __MSG_xxx__ 占位符（backfill 只处理 name/description）→ 回退已解析的 name
+                    title: ext.actionTitle && !/__MSG_/.test(ext.actionTitle) ? ext.actionTitle : (ext.name || String(ext.id)),
+                    iconDataUrl,
+                    letter: String(ext.name || ext.id || "?").trim().charAt(0).toUpperCase(),
+                };
+            });
+            this.toolbar.setExtensionIcons(items);
+        } catch (e) {
+            console.warn("[browser-plugin] 扩展图标刷新失败:", e);
+        }
     }
 
     /** 扩展右键菜单项缓存（跨标签共享，按扩展合并） */
@@ -846,6 +893,10 @@ export class BrowserTab {
         if (this.healthTimer) {
             clearInterval(this.healthTimer);
             this.healthTimer = null;
+        }
+        if (this.onExtHostLoaded) {
+            window.removeEventListener("sy-browser-ext-host-loaded", this.onExtHostLoaded);
+            this.onExtHostLoaded = null;
         }
         try {
             (window as any).browserPlugin?.extensionHost?.disposeCsRuntime?.(this.webview);
