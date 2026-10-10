@@ -282,9 +282,12 @@ export async function showExtensionPopupInPage(opts: {
         }
 
         // js 源码读出后 inline 执行（executeJavaScript 的字符串里 eval）
+        // 注意：scriptSrcs 已由 jsRels 经 resolveRel 解析过，这里不能再解析一次
+        // （二次解析会把 "../pages/popup.js" 变成 "pages/../pages/popup.js" 的另一层
+        //  前缀 → 文件读不到 → jsSources 为空 → 脚本从不执行；AdGuard 因此完全不渲染）
         const jsSources: string[] = [];
         for (const rel of scriptSrcs) {
-            const abs = path.join(extPath, resolveRel(rel));
+            const abs = path.join(extPath, rel);
             const js = readText(fs, abs);
             if (js) jsSources.push(rewriteUrls(js, electronId));
         }
@@ -379,9 +382,9 @@ export async function showExtensionPopupInPage(opts: {
             await opts.evalJs(POPUP_JS_PRELUDE, "__prelude__");
             for (let i = 0; i < jsSources.length; i++) {
                 try {
-                    await opts.evalJs(jsSources[i], jsRels[i]);
+                    await opts.evalJs(jsSources[i], scriptSrcs[i]);
                 } catch (e: any) {
-                    const err = "popup 脚本执行失败[" + i + "](" + jsRels[i] + "): " + String(e?.message || e).slice(0, 200);
+                    const err = "popup 脚本执行失败[" + i + "](" + scriptSrcs[i] + "): " + String(e?.message || e).slice(0, 200);
                     dbg2({ ok: false, error: err });
                     return { ok: false, error: err };
                 }
