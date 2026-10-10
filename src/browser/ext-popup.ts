@@ -249,6 +249,8 @@ export async function showExtensionPopupInPage(opts: {
     electronId: string;
     popupPath: string;
     anchorRect?: { right: number; bottom: number };
+    /** 开始一次 popup 会话（新建扩展世界）—— 在首个脚本执行前调用一次 */
+    begin?: () => Promise<void>;
     evalJs?: (src: string, relPath: string) => Promise<any>;
 }): Promise<{ ok: boolean; error?: string }> {
     const { webview, extPath, electronId, popupPath, anchorRect } = opts;
@@ -370,6 +372,9 @@ export async function showExtensionPopupInPage(opts: {
             // 按(html 顺序)逐文件执行 —— 每文件等价于真实浏览器的独立 script 标签
             // （webpack chunk push → runtime 初始化消化的模式依赖这个语义）。
             // 重声明问题已由「每次打开新建 popup 世界」根治，无需打包。
+            // ★ begin 先新建世界，本次打开的所有文件共享它（世界复用会声明冲突，
+            //   逐文件新建会把 webpack 的 chunk/runtime 拆散到多个世界）。
+            if (opts.begin) await opts.begin();
             // 每个文件执行前伪造 document.currentScript（webpack/rspack publicPath 检测依赖它）
             await opts.evalJs(POPUP_JS_PRELUDE, "__prelude__");
             for (let i = 0; i < jsSources.length; i++) {

@@ -68,9 +68,17 @@ export function disposeCsRuntime(webview: IWebviewTag): void {
     manager?.disposeFor(webview);
 }
 
+/** 开始一次 popup 会话：新建专属世界（同一次打开的后续 eval 共享该世界） */
+export async function beginPopupWorld(webview: IWebviewTag, ext: ICsExtInfo): Promise<void> {
+    if (!manager) return;
+    await manager.beginPopup(webview, ext).catch((e) => {
+        console.warn("[browser-plugin] beginPopupWorld failed:", e);
+    });
+}
+
 /**
- * 在扩展的 popup 世界里执行表达式（chrome.* 经桥全可用；DOM 与页面共享）。
- * 用于把扩展 popup/options 页的 JS 从主世界（chrome 空壳）搬进来跑。
+ * 在当前 popup 会话的世界里执行表达式（需先 beginPopupWorld）。
+ * chrome.* 经桥真实可用；DOM 与页面共享。
  */
 export async function evalPopupJs(webview: IWebviewTag, ext: ICsExtInfo, expr: string): Promise<{ ok: boolean; value?: any; error?: string }> {
     if (!manager) return { ok: false, error: "cs-runtime 未初始化" };
@@ -170,6 +178,33 @@ class CsRuntimeManager {
         }
     }
 
+    private async sessionFor(webview: IWebviewTag): Promise<CsPageSession> {
+        const pageUrl = safeUrl(webview);
+        const wc = remoteWebContents(webview);
+        if (!wc) throw new Error("webContents 不可用");
+        const key = String(wc.id);
+        let s = this.sessions.get(key);
+        if (!s || !s.alive) {
+            s = new CsPageSession(wc, pageUrl, this.host, () => this.sessions.delete(key));
+            this.sessions.set(key, s);
+            await s.start();
+        }
+        s.pageUrl = pageUrl;
+        return s;
+    }
+
+    /** 开始一次 popup 会话：为该扩展新建专属世界（每次调用都新建，防跨打开声明冲突） */
+    async beginPopup(webview: IWebviewTag, ext: ICsExtInfo): Promise<void> {
+        const dbg = (msg: any) => {
+            try {
+                (window as any).__syPopupDbg = { ts: Date.now(), ext: ext.name, ...(typeof msg === "object" ? msg : { msg }) };
+            } catch (e) {}
+        };
+        const s = await this.sessionFor(webview);
+        await s.ensurePopupWorld(ext);
+        dbg({ ok: true, begin: true });
+    }
+
     async evalPopupJs(webview: IWebviewTag, ext: ICsExtInfo, expr: string): Promise<{ ok: boolean; value?: any; error?: string }> {
         // 页面任意 URL（含 about:blank / data: 查看源代码页）都可承载 popup ——
         // 传输走 webContents.debugger，与页面类型无关；仅 content script 注入限定 http(s)
@@ -179,21 +214,9 @@ class CsRuntimeManager {
             } catch (e) {}
         };
         try {
-            const wc = remoteWebContents(webview);
-            if (!wc) {
-                dbg({ ok: false, error: "webContents 不可用" });
-                return { ok: false, error: "webContents 不可用" };
-            }
-            const pageUrl = safeUrl(webview);
-            const key = String(wc.id);
-            let s = this.sessions.get(key);
-            if (!s || !s.alive) {
-                s = new CsPageSession(wc, pageUrl, this.host, () => this.sessions.delete(key));
-                this.sessions.set(key, s);
-                await s.start();
-            }
-            s.pageUrl = pageUrl;
-            const ctxId = await s.ensurePopupWorld(ext);
+            const s = await this.sessionFor(webview);
+            const ctxId = s.currentPopupCtx(ext.electronId);
+            if (!ctxId) return { ok: false, error: "popup 世界未初始化（未 begin）" };
             const r = await s.evaluateInWorld(ctxId, expr);
             dbg({ ...r, ctxId });
             return r;
@@ -210,7 +233,9 @@ class CsPageSession {
     private frameId: string | null = null;
     /** electronId → content 世界 contextId（跑内容脚本） */
     private contentWorlds = new Map<string, number>();
-    /** popup 世界 contextId → electronId（每次打开新建，历史世界留存于映射中） */
+    /** electronId → 当前 popup 世界 contextId（每次打开面板新建） */
+    private popupWorldByExt = new Map<string, number>();
+    /** popup 世界 contextId → electronId（桥调用反查） */
     private popupCtxs = new Map<number, string>();
     /** 当前文档已执行过 CS 入口的扩展（导航后清空） */
     private ran = new Set<string>();
@@ -271,6 +296,7 @@ class CsPageSession {
             // 主框架导航：世界与执行标记全部作废，sync 时按新文档重建
             this.frameId = String(params.frame.id || this.frameId);
             this.contentWorlds.clear();
+            this.popupWorldByExt.clear();
             this.popupCtxs.clear();
             this.ran.clear();
             this.ctxToExt.clear();
@@ -598,6 +624,11 @@ class CsPageSession {
         }
     }
 
+    /** 当前 popup 世界的 contextId（未 begin 时返回 null） */
+    currentPopupCtx(electronId: string): number | null {
+        return this.popupWorldByExt.get(electronId) || null;
+    }
+
     /** 确保扩展的 popup 世界（★ 每次打开面板都新建 —— 世界跨打开持久会让旧垫片/旧声明残留），返回 contextId */
     async ensurePopupWorld(ext: ICsExtInfo): Promise<number> {
         if (!this.alive || !this.frameId) throw new Error("CDP 会话未就绪");
@@ -609,6 +640,7 @@ class CsPageSession {
         });
         const ctxId = r?.executionContextId;
         if (!ctxId) throw new Error("createIsolatedWorld 未返回 contextId");
+        this.popupWorldByExt.set(ext.electronId, ctxId);
         this.popupCtxs.set(ctxId, ext.electronId);
         await this.send("Runtime.addBinding", { name: BRIDGE_NAME, executionContextId: ctxId });
         const shim = buildShim(ext, this.host.messages(ext.path, ext.defaultLocale));

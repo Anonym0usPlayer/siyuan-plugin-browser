@@ -15,7 +15,7 @@ import { BROWSER_PARTITION } from "../constants";
 import { remoteSession } from "../utils/electron";
 import { showExtensionPopupInPage, closeExtensionPopupInPage } from "./ext-popup";
 import { listExtensionMenuItems, evalInExtensionWorld } from "../extensions/sw-bridge";
-import { evalPopupJs } from "../extensions/cs-runtime";
+import { beginPopupWorld, evalPopupJs } from "../extensions/cs-runtime";
 import { POPUP_JS_PRELUDE } from "./ext-popup";
 import type { IExtensionMenuItem } from "./contextMenu";
 
@@ -468,6 +468,7 @@ export class BrowserTab {
             electronId: ext.electronId,
             popupPath: ext.popupPath,
             anchorRect: { right: r.right, bottom: r.bottom },
+            begin: () => beginPopupWorld(this.webview, extInfo),
             evalJs: (src, relPath) => {
                 const fakeUrl = "chrome-extension://" + ext.electronId + "/" + String(relPath).replace(/^\.\//, "");
                 const prefixed =
