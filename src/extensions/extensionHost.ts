@@ -147,6 +147,7 @@ export class ExtensionHost {
             this.extensions = [];
         }
         this.backfillManifestExtras();
+        await this.backfillI18nNames();
         this.injectBackgroundShims();
         // Electron 的 session 扩展不跨重启持久化，启动时全部恢复（原生优先，失败回退垫片）
         await this.reconcileNative();
@@ -340,6 +341,40 @@ export class ExtensionHost {
      * 这三个字段是工具栏图标功能加的，只在安装时从 manifest 解析；
      * 存量数据里没有，读盘时按需补算，否则工具栏永远空白。
      */
+    /**
+     * 旧数据回填：name/description 仍是 __MSG_xxx__ 占位符的条目，按磁盘上的
+     * manifest + _locales 重新解析（安装时的解析可能因当时代码缺陷/环境问题
+     * 失败并被原样持久化，如 AdGuard 的 "__MSG_name__"）。
+     */
+    private async backfillI18nNames(): Promise<void> {
+        const pending = this.extensions.filter((e) => /__MSG_/.test(e.name) || /__MSG_/.test(e.description || ""));
+        if (pending.length === 0) return;
+        const { fs, path } = nodeModules();
+        let changed = false;
+        for (const ext of pending) {
+            try {
+                const manifestPath = path.join(ext.path, "manifest.json");
+                if (!fs.existsSync(manifestPath)) continue;
+                const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+                const locale = manifest.default_locale || ext.defaultLocale || "";
+                const newName = this.resolveManifestString(manifest.name || ext.name, ext.path, locale);
+                const newDesc = this.resolveManifestString(manifest.description || ext.description || "", ext.path, locale);
+                if (newName && newName !== ext.name) {
+                    ext.name = newName;
+                    changed = true;
+                }
+                if (newDesc && newDesc !== ext.description) {
+                    ext.description = newDesc;
+                    changed = true;
+                }
+            } catch {}
+        }
+        if (changed) {
+            await this.persist();
+            console.log(`[browser-plugin] 回填 ${pending.length} 个扩展的 i18n 名称`);
+        }
+    }
+
     private backfillManifestExtras(): void {
         const { fs, path } = nodeModules();
         let changed = false;
@@ -442,7 +477,9 @@ export class ExtensionHost {
         const locales = [defaultLocale, "en", "zh_CN"].filter(Boolean);
         for (const locale of locales) {
             try {
-                const messages = JSON.parse(this.readFileCached(extPath, `_locales/${locale}/messages.json`));
+                const raw = this.readFileCached(extPath, `_locales/${locale}/messages.json`);
+                // 容错：部分扩展的 messages.json 带 BOM，直接 JSON.parse 会抛
+                const messages = JSON.parse(raw.replace(/^\uFEFF/, ""));
                 const msg = messages?.[m[1]]?.message;
                 if (msg) return msg;
             } catch {}
