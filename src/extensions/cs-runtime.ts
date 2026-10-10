@@ -258,6 +258,12 @@ class CsRuntimeManager {
         }
         return await evalInSwViaMainWindow(electronId, expr);
     }
+
+    /** manager 级 isolated world 直调：为该 webview 取会话走 flat 通道 */
+    async evalExtensionWorldAny(webview: IWebviewTag, electronId: string, expr: string): Promise<{ ok: boolean; value?: any; error?: string; contextId?: number }> {
+        const s = await this.sessionFor(webview);
+        return await s.evalInExtensionWorldFlat(electronId, expr);
+    }
 }
 
 class CsPageSession {
@@ -294,9 +300,9 @@ class CsPageSession {
         }
     }
 
-    private send(method: string, params: any = {}, timeoutMs = 15000): Promise<any> {
+    private send(method: string, params: any = {}, timeoutMs = 15000, sessionId?: string): Promise<any> {
         return Promise.race([
-            this.wc.debugger.sendCommand(method, params),
+            this.wc.debugger.sendCommand(method, params, sessionId),
             new Promise((_, reject) => setTimeout(() => reject(new Error(`CDP ${method} 超时`)), timeoutMs)),
         ]);
     }
@@ -873,6 +879,77 @@ class CsPageSession {
         return ctxId;
     }
 
+    /**
+     * flat 版 isolated world 直调（无 --remote-debugging-port 也可用）：
+     * Target.getTargets 按 URL 找页面 target → attachToTarget{flatten} →
+     * 该 flat session 里 Runtime.enable（会重放 executionContextCreated，
+     * 事件经 debugger "message" 事件带 sessionId 到达）→ 按
+     * __syCsRt_<electronId> 前缀（cs-runtime 自建世界）或 isolated+origin
+     * 匹配 contextId → Runtime.evaluate。用完 detachFromTarget 清理。
+     */
+    async evalInExtensionWorldFlat(electronId: string, expr: string): Promise<{ ok: boolean; value?: any; error?: string; contextId?: number }> {
+        const pageUrl = this.pageUrl;
+        const norm = (u: string) => String(u || "").split("#")[0];
+        let sid: string | null = null;
+        let handler: ((_e: any, method: string, params: any, evtSid?: string) => void) | null = null;
+        try {
+            const r = await this.send("Target.getTargets");
+            const infos: any[] = (r && r.targetInfos) || [];
+            const pages = infos.filter((t) => t.type === "webview" || t.type === "page" || t.type === "iframe");
+            const page = pages.find((t) => norm(t.url) === norm(pageUrl))
+                || pages.find((t) => pageUrl && norm(t.url) === norm(pageUrl.split("?")[0]));
+            if (!page) return { ok: false, error: "未找到页面 CDP target" };
+            const a: any = await this.send("Target.attachToTarget", { targetId: page.targetId, flatten: true });
+            sid = a && a.sessionId;
+            if (!sid) return { ok: false, error: "attachToTarget 未返回 sessionId" };
+
+            let extContextId: number | null = null;
+            handler = (_e: any, method: string, params: any, evtSid?: string) => {
+                if (evtSid !== sid || method !== "Runtime.executionContextCreated") return;
+                const c = params?.context || {};
+                const isIsolated = c.type === "isolated" || (c.auxData && c.auxData.type === "isolated");
+                if (String(c.name || "").indexOf(CS_WORLD_PREFIX) === 0) {
+                    // 自建世界优先 —— Electron 原生世界的 CS 已因空壳 chrome 抛错
+                    if (c.name.slice(CS_WORLD_PREFIX.length) === electronId) extContextId = c.id;
+                    return;
+                }
+                if (isIsolated && String(c.origin || "").includes(electronId)) extContextId = c.id;
+            };
+            this.wc.debugger.on("message", handler);
+            await this.send("Runtime.enable", {}, 8000, sid);
+            // 上下文事件可能未及时到达，轮询等待
+            for (let i = 0; i < 20 && extContextId === null; i++) {
+                await new Promise((r2) => setTimeout(r2, 200));
+            }
+            if (extContextId === null) {
+                return { ok: false, error: "该页面没有此扩展的运行时世界（页面未加载完成或 cs-runtime 未就绪）" };
+            }
+            const er: any = await this.send(
+                "Runtime.evaluate",
+                { expression: expr, returnByValue: true, awaitPromise: true, contextId: extContextId },
+                15000,
+                sid
+            );
+            if (er && er.exceptionDetails) {
+                return {
+                    ok: false,
+                    error: String(er.exceptionDetails?.exception?.description || er.exceptionDetails?.text || "isolated world 执行异常").slice(0, 300),
+                    contextId: extContextId,
+                };
+            }
+            return { ok: true, value: er && er.result ? er.result.value : null, contextId: extContextId };
+        } catch (e: any) {
+            return { ok: false, error: String(e?.message || e) };
+        } finally {
+            if (handler) {
+                try { this.wc.debugger.off("message", handler); } catch {}
+            }
+            if (sid) {
+                try { this.send("Target.detachFromTarget", { sessionId: sid }, 3000, sid); } catch {}
+            }
+        }
+    }
+
     async evalInSw(ext: ICsExtInfo, expr: string): Promise<{ value?: any; err?: string }> {
         let eid = ext.electronId;
         // HTTP CDP 熔断生效时直接走进程内 flat 通道（正常启动无 --remote-debugging-port）。
@@ -950,6 +1027,12 @@ async function evalInSwViaMainWindow(electronId: string, expr: string): Promise<
 export function evalInSwBridge(ext: { electronId: string }, expr: string): Promise<{ value?: any; err?: string }> {
     if (!manager) return Promise.resolve({ err: "cs-runtime 未初始化" });
     return manager.evalInSwAny(ext.electronId, expr);
+}
+
+/** manager 级 isolated world 直调（flat 通道，无调试端口也可用）——Clip 划词等 */
+export function evalInExtensionWorldBridge(webview: IWebviewTag, electronId: string, expr: string): Promise<{ ok: boolean; value?: any; error?: string; contextId?: number }> {
+    if (!manager) return Promise.resolve({ ok: false, error: "cs-runtime 未初始化" });
+    return manager.evalExtensionWorldAny(webview, electronId, expr);
 }
 
 function safeUrl(webview: IWebviewTag): string {

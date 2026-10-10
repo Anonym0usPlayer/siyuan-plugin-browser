@@ -15,7 +15,7 @@ import { BROWSER_PARTITION } from "../constants";
 import { remoteSession } from "../utils/electron";
 import { showExtensionPopupInPage, closeExtensionPopupInPage, injectExtensionPageRuntime } from "./ext-popup";
 import { listExtensionMenuItems, evalInExtensionWorld } from "../extensions/sw-bridge";
-import { beginPopupWorld, evalPopupJs, evalInSwBridge } from "../extensions/cs-runtime";
+import { beginPopupWorld, evalPopupJs, evalInSwBridge, evalInExtensionWorldBridge } from "../extensions/cs-runtime";
 import { POPUP_JS_PRELUDE } from "./ext-popup";
 import type { IExtensionMenuItem } from "./contextMenu";
 
@@ -155,10 +155,7 @@ export class BrowserTab {
                     const msg = isSend
                         ? { func: "siyuanGetReadability", tabId: 0 }
                         : { func: "copy", tabId: 0, srcUrl: this.controller.lastCtxSrcUrl ?? undefined };
-                    const r = await evalInExtensionWorld(
-                        this.webview,
-                        item.electronId,
-                        `(() => {
+                    const expr = `(() => {
                             try {
                                 if (typeof eventDispatcher !== "function") {
                                     return { err: "该扩展未暴露全局分发函数（仅 SiYuan Clip 已适配）" };
@@ -166,8 +163,12 @@ export class BrowserTab {
                                 eventDispatcher(${JSON.stringify(msg)}, null, function () {});
                                 return { dispatched: true };
                             } catch (e) { return { err: String(e && e.stack || e).slice(0, 300) }; }
-                        })()`,
-                    );
+                        })()`;
+                    // flat 通道优先（进程内 Target 域，无调试端口也可用），HTTP /json/list 兜底
+                    let r = await evalInExtensionWorldBridge(this.webview, item.electronId, expr);
+                    if (!r.ok && r.error && !r.error.includes("该页面没有此扩展的运行时世界")) {
+                        r = await evalInExtensionWorld(this.webview, item.electronId, expr);
+                    }
                     if (!r.ok || (r.value && r.value.err)) {
                         showMessage(`「${item.title}」触发失败: ${r.error || (r.value && r.value.err)}`, 5000, "error");
                     }
