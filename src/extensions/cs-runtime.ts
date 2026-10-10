@@ -462,7 +462,13 @@ class CsPageSession {
                             self.addEventListener("unhandledrejection", function (e) {
                                 try {
                                     var msg = e && e.reason && (e.reason.message || String(e.reason)) || "";
-                                    if (msg.indexOf("Receiving end") >= 0 || msg.indexOf("establish connection") >= 0) {
+                                    // Electron 原生世界三件套噪音：消息路由断（Receiving end）、
+                                    // storage.sync 服务缺失（"sync" is not available in this
+                                    // instance of Chrome —— Chromium 152 原生副本已非空壳，
+                                    // 顶层读设置即抛）。均为死代码副本的功能性缺失，消音。
+                                    if (msg.indexOf("Receiving end") >= 0
+                                        || msg.indexOf("establish connection") >= 0
+                                        || msg.indexOf("not available in this instance of Chrome") >= 0) {
                                         e.preventDefault();
                                     }
                                 } catch (e2) {}
@@ -612,19 +618,36 @@ class CsPageSession {
         const result = ext
             ? await this.route(ext, req).catch((e) => ({ err: String(e?.message || e) }))
             : { err: "unknown context" };
+        const replyExpr = `window.__syExtHostResolve && window.__syExtHostResolve(${JSON.stringify(
+            JSON.stringify({ reqId: req.reqId, ...result })
+        )})`;
         try {
             await this.send(
                 "Runtime.evaluate",
                 {
-                    expression: `window.__syExtHostResolve && window.__syExtHostResolve(${JSON.stringify(
-                        JSON.stringify({ reqId: req.reqId, ...result })
-                    )})`,
+                    expression: replyExpr,
                     contextId: ctxId,
                     returnByValue: false,
                 },
                 10000
             );
-        } catch {}
+        } catch {
+            // 回写失败（导航竞态/上下文失效）：route 可能已实际执行成功（剪藏场景），
+            // 丢失响应会让 CS 端 pending 挂到 bridge timeout。按世界身份重找新
+            // contextId 补写一次；世界已销毁时补写自然落空（旧 pending 随堆销毁，无害）。
+            if (!electronId) return;
+            const retryCtx = this.contentWorlds.get(electronId)
+                ?? [...this.popupCtxs.entries()].find(([, eid]) => eid === electronId)?.[0];
+            if (retryCtx && retryCtx !== ctxId) {
+                try {
+                    await this.send(
+                        "Runtime.evaluate",
+                        { expression: replyExpr, contextId: retryCtx, returnByValue: false },
+                        10000
+                    );
+                } catch {}
+            }
+        }
     }
 
     private async route(ext: ICsExtInfo, req: any): Promise<{ data?: any; err?: string }> {
@@ -1343,7 +1366,10 @@ function buildShim(ext: ICsExtInfo, messages: Record<string, any>): string {
             __pending[reqId] = rec;
             rec.timer = setTimeout(function () {
                 if (__pending[reqId]) { delete __pending[reqId]; reject(new Error("__syExtHost bridge timeout")); }
-            }, 12000);
+                // 25s：与宿主 route 内部超时（sendmessage expr 25s、__noHandlers 重试
+                // 3×1.5s、evalInSw 各级 12s）对齐 —— 此前 12s 比宿主内部等待更短，
+                // 宿主还在正常等待/重试时桥先断，产生假超时报错（剪藏实际成功）。
+            }, 25000);
             try {
                 window.${BRIDGE_NAME}(JSON.stringify({ reqId: reqId, type: type, args: args === undefined ? null : args }));
             } catch (e) {
