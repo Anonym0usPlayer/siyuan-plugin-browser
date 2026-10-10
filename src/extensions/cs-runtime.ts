@@ -28,11 +28,16 @@
  * 与 disposeCsRuntime 清理。
  */
 import type { IWebviewTag } from "../types";
-import { CS_WORLD_PREFIX, cdpEvalOnce, cdpHttpLikelyDead, evalInSwFlat, findSwTarget, SW_FLAT_UNAVAILABLE } from "./sw-bridge";
+import { CS_WORLD_PREFIX, cdpEvalOnce, cdpHttpLikelyDead, evalInSwFlat, evalInSwFlatCached, findSwFlatSession, findSwTarget, FlatCommandSender, SW_FLAT_UNAVAILABLE } from "./sw-bridge";
 
 const BRIDGE_NAME = "__syExtHost";
 /** popup/options 页专属世界前缀（独立于 content 世界，避免顶层声明冲突） */
 const POPUP_WORLD_PREFIX = "__syCsPop_";
+
+/** SW→CS 回程监听窗口时长（routeSendMessage 派发后轮询 SW 垫片 outbox 的时间上限） */
+const SW_REPLY_WINDOW_MS = 45_000;
+/** 取走 SW 垫片 v13 __syTabsOutbox 里待发往 content 世界的消息（原子取走） */
+const SW_TABS_DRAIN_EXPR = `(() => { const out = self.__syTabsOutbox || []; self.__syTabsOutbox = []; return JSON.stringify(out); })()`;
 
 export interface ICsExtInfo {
     electronId: string;
@@ -283,6 +288,8 @@ class CsPageSession {
     private ran = new Set<string>();
     private attached = false;
     private ctxToExt = new Map<number, string>();
+    /** SW→CS 回程泵（electronId → 轮询状态）：routeSendMessage 派发后限时运行 */
+    private swReplyPumps = new Map<string, { deadline: number; busy: boolean; timer: ReturnType<typeof setInterval> }>();
 
     constructor(
         private wc: any,
@@ -296,6 +303,10 @@ class CsPageSession {
     }
 
     close(): void {
+        for (const [eid, w] of this.swReplyPumps) {
+            clearInterval(w.timer);
+        }
+        this.swReplyPumps.clear();
         if (this.attached) {
             try {
                 this.wc.debugger.detach();
@@ -431,8 +442,12 @@ class CsPageSession {
 
     private silencedCtxs = new Set<number>();
 
-    /** 原生世界静默桩：chrome.runtime.sendMessage/tabs.sendMessage 变 no-op，
-     *  消除死代码副本的 lastError 刷屏。功能由自建世界（__syCsRt_）承担。 */
+    /** 原生世界消音：原生 isolated world 是死代码副本（消息路由断），其周期性
+     *  chrome.runtime.sendMessage（MV3 Promise 风格）reject → unhandledrejection
+     *  → DevTools 刷 "Could not establish connection"。
+     *  注意：原生 chrome 属性是不可配置的 native accessor，defineProperty 装不上桩
+     *  （实测）—— 只能加 unhandledrejection preventDefault（隔离世界全局私有，
+     *  只消音本世界，不影响自建世界/面板世界的真实错误）。 */
     private async silenceNativeWorld(ctxId: number): Promise<void> {
         if (this.silencedCtxs.has(ctxId) || this.silencedCtxs.size > 200) return;
         this.silencedCtxs.add(ctxId);
@@ -444,14 +459,14 @@ class CsPageSession {
                         try {
                             if (window.__sySilenced) return;
                             window.__sySilenced = true;
-                            if (typeof chrome === "undefined" || !chrome.runtime) return;
-                            var eventHub = function () {
-                                return { addListener: function () {}, removeListener: function () {}, hasListener: function () { return false; } };
-                            };
-                            var noSend = function () { return Promise.resolve(undefined); };
-                            try { Object.defineProperty(chrome.runtime, "sendMessage", { configurable: true, get: function () { return noSend; } }); } catch (e) {}
-                            try { if (chrome.tabs) { Object.defineProperty(chrome.tabs, "sendMessage", { configurable: true, get: function () { return noSend; } }); } } catch (e) {}
-                            try { chrome.runtime.onMessage = eventHub(); } catch (e) {}
+                            self.addEventListener("unhandledrejection", function (e) {
+                                try {
+                                    var msg = e && e.reason && (e.reason.message || String(e.reason)) || "";
+                                    if (msg.indexOf("Receiving end") >= 0 || msg.indexOf("establish connection") >= 0) {
+                                        e.preventDefault();
+                                    }
+                                } catch (e2) {}
+                            });
                         } catch (e) {}
                     })()`,
                     contextId: ctxId,
@@ -549,6 +564,26 @@ class CsPageSession {
         } else {
             console.log(`[browser-plugin] cs-runtime: "${ext.name}" 内容脚本已在自建世界运行 (${ext.electronId})`);
         }
+        // DOMContentLoaded 兜底：重放注入时文档已就绪，DOMContentLoaded 不会再触发，
+        // 扩展在它的回调里注册的 onMessage 监听器（实测 Clip eventDispatcher）会永久
+        // 错过 → 面板发送/消息全链静默无反应。每世界补发一次。
+        try {
+            await this.send(
+                "Runtime.evaluate",
+                {
+                    expression: `(function () {
+                        if (document.readyState === "loading") return "loading";
+                        if (self.__syDomReadyDispatched) return "already";
+                        self.__syDomReadyDispatched = true;
+                        try { document.dispatchEvent(new Event("DOMContentLoaded")); } catch (e) {}
+                        return "dispatched";
+                    })()`,
+                    contextId: ctxId,
+                    returnByValue: false,
+                },
+                8000
+            );
+        } catch {}
     }
 
     // ===== CS → 宿主 桥请求 =====
@@ -626,6 +661,19 @@ class CsPageSession {
             const r = await this.kernelFetchNode(url, method, headers, body);
             return { data: r };
         }
+        if (req.type === "sendmessage-big") {
+            // 大消息：content 世界已把完整 payload 存入 chrome.storage.local（binding
+            // 字符串通道挂大 payload），这里从 SW 的真实 storage 读回 → 走常规路由
+            const r1 = await this.evalInSw(
+                ext,
+                `(async () => JSON.stringify((await chrome.storage.local.get("__syBigMsg"))["__syBigMsg"] ?? null))()`
+            );
+            let bigMsg: any = null;
+            try { bigMsg = JSON.parse(String(r1.value ?? "null")); } catch {}
+            const out = await this.routeSendMessage(ext, { msg: bigMsg, senderUrl: String(args.senderUrl || "") });
+            await this.evalInSw(ext, `chrome.storage.local.remove("__syBigMsg")`).catch(() => null);
+            return out;
+        }
         if (req.type === "sendmessage") {
             return await this.routeSendMessage(ext, args);
         }
@@ -647,12 +695,96 @@ class CsPageSession {
     }
 
     /**
+     * SW→CS 回程（chrome.tabs.sendMessage）监听窗口：SW 垫片 v13 把回程请求
+     * 写入 __syTabsOutbox，这里在窗口期内轮询取走 → 派发到本页 content 世界
+     * → 写回响应。限时启动（每次 CS→SW 派发后续期）避免常驻轮询把 MV3 SW
+     * 钉在活跃态；本页没有该扩展的 content 世界时不启动（无接收方）。
+     */
+    private noteSwReplyWindow(electronId: string): void {
+        if (!this.contentWorlds.has(electronId)) return;
+        const w = this.swReplyPumps.get(electronId);
+        if (w) {
+            w.deadline = Date.now() + SW_REPLY_WINDOW_MS;
+            return;
+        }
+        const entry: { deadline: number; busy: boolean; timer: ReturnType<typeof setInterval> } = {
+            deadline: Date.now() + SW_REPLY_WINDOW_MS,
+            busy: false,
+            timer: null as any,
+        };
+        entry.timer = setInterval(() => void this.pumpSwReplies(electronId, entry), 600);
+        this.swReplyPumps.set(electronId, entry);
+    }
+
+    private stopSwReplyPump(electronId: string, entry: { timer: ReturnType<typeof setInterval> }): void {
+        clearInterval(entry.timer);
+        this.swReplyPumps.delete(electronId);
+    }
+
+    private async pumpSwReplies(electronId: string, entry: { deadline: number; busy: boolean; timer: ReturnType<typeof setInterval> }): Promise<void> {
+        if (Date.now() > entry.deadline || !this.alive || !this.contentWorlds.has(electronId)) {
+            this.stopSwReplyPump(electronId, entry);
+            return;
+        }
+        if (entry.busy) return;
+        entry.busy = true;
+        try {
+            const sender: FlatCommandSender = (method, params, sessionId) => Promise.race([
+                this.wc.debugger.sendCommand(method, params, sessionId),
+                new Promise((_, reject) => setTimeout(() => reject(new Error(`CDP ${method} 超时`)), 8000)),
+            ]);
+            let r = await evalInSwFlatCached(sender, electronId, SW_TABS_DRAIN_EXPR);
+            if (r.err === SW_FLAT_UNAVAILABLE) {
+                // 缓存缺失/失效：刚处理过消息的 SW 通常仍活跃，做一次不唤醒的重找
+                const found = await findSwFlatSession(sender, electronId);
+                if (!found) {
+                    this.stopSwReplyPump(electronId, entry);
+                    return;
+                }
+                r = await evalInSwFlatCached(sender, electronId, SW_TABS_DRAIN_EXPR);
+                if (r.err) {
+                    this.stopSwReplyPump(electronId, entry);
+                    return;
+                }
+            } else if (r.err) {
+                this.stopSwReplyPump(electronId, entry);
+                return;
+            }
+            let reqs: any[] = [];
+            try { reqs = JSON.parse(String(r.value ?? "[]")) || []; } catch {}
+            for (const req of reqs) {
+                if (!req || typeof req.id !== "string") continue;
+                const out = await this.dispatchToContentWorld({ electronId } as ICsExtInfo, {
+                    msg: req.msg,
+                    tabId: typeof req.tabId === "number" ? req.tabId : undefined,
+                    senderUrl: `chrome-extension://${electronId}/background.js`,
+                });
+                // 写回响应（无接收方/异常 → undefined，对齐 Chrome lastError 语义）
+                const respJson = JSON.stringify(out.data === undefined ? null : out.data);
+                const rid = JSON.stringify(req.id);
+                await evalInSwFlatCached(
+                    sender,
+                    electronId,
+                    `(() => { const p = self.__syTabsPending && self.__syTabsPending[${rid}]; if (p) { delete self.__syTabsPending[${rid}]; p(${JSON.stringify(respJson)}); } return 1; })()`
+                ).catch(() => null);
+            }
+        } catch {
+            // 会话失效/调试通道异常 → 停泵（下次 CS→SW 派发会重新开窗）
+            this.stopSwReplyPump(electronId, entry);
+        } finally {
+            entry.busy = false;
+        }
+    }
+
+    /**
      * CS→SW 消息：宿主经 CDP 直调 SW 垫片 v4 收集的 onMessage handlers。
      * 不走 storage.onChanged 中转 —— 实测 Electron SW 里该事件不可靠（自写不触发）。
      * 语义对齐 Chrome：handler 返回 true = 异步 sendResponse；否则首个非 undefined
      * 同步返回值即响应；无处理器/超时按 undefined 回调。
      */
     private async routeSendMessage(ext: ICsExtInfo, args: any): Promise<{ data?: any; err?: string }> {
+        // 消息派发后 SW 侧可能经 tabs.sendMessage 回程（剪藏 tip/结果等）—— 开监听窗口
+        this.noteSwReplyWindow(ext.electronId);
         const msgJson = JSON.stringify(args.msg === undefined ? null : args.msg);
         const senderJson = JSON.stringify({ id: ext.electronId, url: String(args.senderUrl || "").slice(0, 300) });
         const expr = `(async () => {
@@ -1204,14 +1336,14 @@ function buildShim(ext: ICsExtInfo, messages: Record<string, any>): string {
             if (r.err) p.reject(new Error(r.err)); else p.resolve(r.data);
         } catch (e) {}
     };
-    function hostCall(type, args) {
+    function hostCallOnce(type, args) {
         return new Promise(function (resolve, reject) {
             var reqId = "q" + (++__seq) + Math.random().toString(36).slice(2, 8);
             var rec = { resolve: resolve, reject: reject, timer: 0 };
             __pending[reqId] = rec;
             rec.timer = setTimeout(function () {
                 if (__pending[reqId]) { delete __pending[reqId]; reject(new Error("__syExtHost bridge timeout")); }
-            }, 30000);
+            }, 12000);
             try {
                 window.${BRIDGE_NAME}(JSON.stringify({ reqId: reqId, type: type, args: args === undefined ? null : args }));
             } catch (e) {
@@ -1221,11 +1353,39 @@ function buildShim(ext: ICsExtInfo, messages: Record<string, any>): string {
             }
         });
     }
+    // 桥调用超时自动重试一次：SW 冷唤醒窗口期（巨型 background 顶层执行）首调可能
+    // 撞上超时，此时 SW 已醒、重发即成功。有副作用的 sendmessage/tabs-sendmessage
+    // 不重试（避免重复剪藏）。
+    function hostCall(type, args) {
+        var p = hostCallOnce(type, args);
+        if (type === "sendmessage" || type === "tabs-sendmessage") return p;
+        return p.catch(function (e) {
+            if (e && /bridge timeout/.test(String(e && e.message || e))) return hostCallOnce(type, args);
+            throw e;
+        });
+    }
     function cbStyle(p, cb) {
         if (typeof cb === "function") {
             p.then(function (v) { try { cb(v); } catch (e) {} }, function () { try { cb(undefined); } catch (e) {} });
         }
         return p;
+    }
+    // 大消息（如 upload-copy：整页 DOM + 图片 base64，可达数 MB）不能走 binding
+    // 字符串通道（实测大 payload 挂死）—— 存 chrome.storage.local 由宿主读回。
+    // storage 是 CS 与 SW 都真实可用的通道，MB 级容量足够。
+    function sendMessageShim(msg, cb) {
+        var senderUrl = String(location.href).slice(0, 300);
+        var json = null;
+        try { json = JSON.stringify(msg === undefined ? null : msg); } catch (e) {}
+        if (json && json.length > 600000) {
+            return cbStyle(
+                chrome.storage.local.set({ __syBigMsg: json }).then(function () {
+                    return hostCall("sendmessage-big", { senderUrl: senderUrl });
+                }),
+                cb
+            );
+        }
+        return cbStyle(hostCall("sendmessage", { msg: msg === undefined ? null : msg, senderUrl: senderUrl }), cb);
     }
     // 内核请求代理：https 页面的隔离世界 fetch http://127.0.0.1/<localhost> 是
     // mixed content，直接 "Failed to fetch"（实测 Clip 发送/笔记本列表全挂）。
@@ -1308,10 +1468,7 @@ function buildShim(ext: ICsExtInfo, messages: Record<string, any>): string {
                 hasListener: function (fn) { return fns.indexOf(fn) >= 0; },
             };
         })(),
-        sendMessage: function (msg, cb) {
-            var p = hostCall("sendmessage", { msg: msg === undefined ? null : msg, senderUrl: String(location.href).slice(0, 300) });
-            return cbStyle(p, cb);
-        },
+        sendMessage: sendMessageShim,
         // 长连接端口：postMessage 经宿主 routePortMessage 派发到 SW 的
         // onConnect 端口处理器（垫片 v5），outbox 回包 dispatch 给本端监听器。
         // portId 跨 postMessage 复用 —— 同一 connect 会话对应 SW 里同一个 port。

@@ -405,6 +405,20 @@ export async function showExtensionPopupInPage(opts: {
                     return { ok: false, error: err };
                 }
             }
+            // DOMContentLoaded 兜底：重放注入时文档已就绪，DOMContentLoaded 不会再触发，
+            // 扩展在它的回调里做的初始化/监听注册会永久错过 —— 每世界补发一次。
+            try {
+                await opts.evalJs(
+                    `(function () {
+                        if (document.readyState === "loading") return "loading";
+                        if (self.__syDomReadyDispatched) return "already";
+                        self.__syDomReadyDispatched = true;
+                        try { document.dispatchEvent(new Event("DOMContentLoaded")); } catch (e) {}
+                        return "dispatched";
+                    })()`,
+                    "__domready__"
+                );
+            } catch (e) {}
         }
         dbg2({ ok: true });
         return { ok: true };
@@ -489,6 +503,19 @@ export async function injectExtensionPageRuntime(opts: {
         for (let i = 0; i < jsSources.length; i++) {
             await opts.evalJs(jsSources[i], scriptSrcs[i]);
         }
+        // DOMContentLoaded 兜底（与 showExtensionPopupInPage 同理由）
+        try {
+            await opts.evalJs(
+                `(function () {
+                    if (document.readyState === "loading") return "loading";
+                    if (self.__syDomReadyDispatched) return "already";
+                    self.__syDomReadyDispatched = true;
+                    try { document.dispatchEvent(new Event("DOMContentLoaded")); } catch (e) {}
+                    return "dispatched";
+                })()`,
+                "__domready__"
+            );
+        } catch (e) {}
         return { ok: true, scripts: jsSources.length };
     } catch (e: any) {
         return { ok: false, error: String(e?.message || e).slice(0, 300) };

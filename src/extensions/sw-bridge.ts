@@ -344,6 +344,9 @@ export async function findSwFlatSession(
         } catch {}
         if (attempt === 0 && wake) {
             try { await wake(); } catch {}
+            // 给 SW 顶层执行留就绪时间（垫片/巨型 background 的启动期），
+            // 立刻 evaluate 会撞上初始化中 worker 的挂起/失败
+            await new Promise((r2) => setTimeout(r2, 800));
         }
         await new Promise((r2) => setTimeout(r2, 300));
     }
@@ -381,6 +384,31 @@ export async function evalInSwFlat(
         }
     }
     return { err: SW_FLAT_UNAVAILABLE };
+}
+
+/**
+ * 用缓存的 flat session 求值（不唤醒、不重找）—— SW 回程轮询专用：
+ * SW 已休眠/缓存失效时快速失败，调用方收到 SW_FLAT_UNAVAILABLE 应停止本轮，
+ * 避免常驻轮询反复触发 findSwFlatSession 的重试循环。
+ */
+export async function evalInSwFlatCached(
+    sendCommand: FlatCommandSender,
+    electronId: string,
+    expr: string,
+): Promise<{ value?: any; err?: string }> {
+    const cached = swFlatSessionCache.get(electronId);
+    if (!cached) return { err: SW_FLAT_UNAVAILABLE };
+    try {
+        const r = await sendCommand("Runtime.evaluate", { expression: expr, returnByValue: true, awaitPromise: true }, cached.sessionId);
+        if (r && r.exceptionDetails) {
+            swFlatSessionCache.delete(electronId);
+            return { err: String(r.exceptionDetails?.exception?.description || r.exceptionDetails?.text || "SW 执行异常").slice(0, 200) };
+        }
+        return { value: r && r.result ? r.result.value : null };
+    } catch {
+        swFlatSessionCache.delete(electronId);
+        return { err: SW_FLAT_UNAVAILABLE };
+    }
 }
 
 export async function findSwTarget(electronId: string): Promise<ISwTarget | null> {

@@ -150,7 +150,7 @@ export class ExtensionHost {
         }
         this.backfillManifestExtras();
         await this.backfillI18nNames();
-        this.injectBackgroundShims();
+        await this.injectBackgroundShims();
         // Electron 的 session 扩展不跨重启持久化，启动时全部恢复（原生优先，失败回退垫片）
         await this.reconcileNative();
         this.loaded = true;
@@ -174,9 +174,9 @@ export class ExtensionHost {
      *
      * 幂等：文件头有标记就跳过；扩展更新（文件重写）后标记消失会重新注入。
      */
-    private injectBackgroundShims(): void {
+    private async injectBackgroundShims(): Promise<void> {
         const { fs, path } = nodeModules();
-        const SHIM_MARK = "/* sy-bg-shim:v12 */";
+        const SHIM_MARK = "/* sy-bg-shim:v14 */";
         let changedShimCount = 0;
         for (const ext of this.extensions) {
             try {
@@ -416,6 +416,63 @@ export class ExtensionHost {
                 self.__syTabCreatedFns = tcFns;
                 self.__syTabUpdatedFns = tuFns;
                 self.__syTabActivatedFns = taFns;
+                // 5d) tabs.sendMessage 回程路由：Electron 原生实现恒报
+                //     "Receiving end does not exist"（SW↔CS 消息路由缺失）——
+                //     剪藏 tip/结果回不到页面、lastError 刷屏的根因。请求写
+                //     __syTabsOutbox，宿主在 routeSendMessage 后的监听窗口内
+                //     轮询取走 → 派发到 content 世界 → evalInSw 写回 __syTabsPending。
+                try {
+                    var tsmSeq = 0;
+                    var tsm = function (tabId, msg, cb, respCb) {
+                        var callback = typeof cb === "function" ? cb : (typeof respCb === "function" ? respCb : null);
+                        var rid = "t" + (++tsmSeq) + "_" + Date.now().toString(36);
+                        self.__syTabsOutbox = self.__syTabsOutbox || [];
+                        self.__syTabsOutbox.push({ id: rid, tabId: typeof tabId === "number" ? tabId : null, msg: msg === undefined ? null : msg });
+                        if (callback) {
+                            self.__syTabsPending = self.__syTabsPending || {};
+                            self.__syTabsPending[rid] = function (respJson) {
+                                delete self.__syTabsPending[rid];
+                                var resp;
+                                try { resp = respJson == null ? undefined : JSON.parse(respJson); } catch (e3) { resp = undefined; }
+                                try { callback(resp); } catch (e3) {}
+                            };
+                            setTimeout(function () {
+                                if (self.__syTabsPending && self.__syTabsPending[rid]) {
+                                    delete self.__syTabsPending[rid];
+                                    try { callback(undefined); } catch (e3) {}
+                                }
+                            }, 20000);
+                        }
+                    };
+                    try { Object.defineProperty(chrome.tabs, "sendMessage", { configurable: true, get: function () { return tsm; } }); }
+                    catch (e2) { chrome.tabs.sendMessage = tsm; }
+                } catch (e) {}
+            }
+        } catch (e) {}
+        // 5e) chrome.storage.sync 修复：Electron SW 原生 sync.get 回调 undefined
+        //     （实测 SiYuan Clip storageSyncGet 拿到 undefined → 解构抛 TypeError
+        //     → article 剪藏流程崩进 catch → tip_siyuan_kernel_unavailable）。
+        //     与宿主 CS 代理同策略：sync 代理到 local（CS 世界经宿主代理同样落
+        //     在 SW 的 storage.local，数据同源）。
+        try {
+            if (chrome.storage && (!chrome.storage.sync || !chrome.storage.sync.__syShim)) {
+                var syncArea = {
+                    __syShim: true,
+                    get: function (keys, cb) {
+                        var done = function (v) { if (typeof cb === "function") { try { cb(v == null ? {} : v); } catch (e3) {} } };
+                        try {
+                            var p = chrome.storage.local.get(keys == null ? {} : keys, done);
+                            if (p && typeof p.then === "function") p.then(function (v) { done(v); }, function () { done({}); });
+                            return p;
+                        } catch (e2) { done({}); }
+                    },
+                    set: function (items, cb) { return chrome.storage.local.set(items == null ? {} : items, cb); },
+                    remove: function (keys, cb) { return chrome.storage.local.remove(keys == null ? [] : keys, cb); },
+                    clear: function (cb) { return chrome.storage.local.clear(cb); },
+                    getBytesInUse: function (keys, cb) { var v = 0; if (typeof cb === "function") { try { cb(v); } catch (e3) {} } return Promise.resolve(v); },
+                };
+                try { Object.defineProperty(chrome.storage, "sync", { configurable: true, get: function () { return syncArea; } }); }
+                catch (e2) { chrome.storage.sync = syncArea; }
             }
         } catch (e) {}
     } catch (e) {}
@@ -430,14 +487,21 @@ export class ExtensionHost {
         if (changedShimCount > 0) {
             // 垫片改了 SW 源码，Electron 侧的已加载扩展需要卸掉重载 ——
             // reconcileNative（紧随其后调用）发现原生缺席会重新 loadExtension
-            try {
-                const ses = remoteSession();
-                if (ses?.getAllExtensions && ses.unloadExtension) {
-                    for (const x of ses.getAllExtensions()) {
-                        try { ses.unloadExtension(x.id); } catch {}
-                    }
+            const ses = remoteSession();
+            if (ses?.getAllExtensions && ses.unloadExtension) {
+                for (const x of ses.getAllExtensions()) {
+                    try { ses.unloadExtension(x.id); } catch {}
                 }
-            } catch {}
+            }
+            // 关键：分区里持久化的 SW 注册/脚本缓存不随 loadExtension 更新
+            // （实测：background.js 已重写为 v13，重载后 SW 仍执行 v12 旧脚本）。
+            // 清掉 SW 存储后，重载注册必然从磁盘拉新脚本。仅垫片版本变更时执行；
+            // 网站自身的 SW 被清后下次访问会自动重注册，无感。
+            if (ses?.clearStorageData) {
+                try {
+                    await ses.clearStorageData({ storages: ["serviceworkers"] });
+                } catch {}
+            }
         }
     }
 
