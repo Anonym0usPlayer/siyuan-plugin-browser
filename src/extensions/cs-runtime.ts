@@ -20,8 +20,10 @@
  * 4. chrome.runtime.sendMessage 经 SW 垫片 v4 的 storage 路由（__syRouteIn /
  *    __syRouteResp_<id>）往返 —— 与 SW 侧收集的 onMessage handlers 配对；
  * 5. 内容脚本入口文件从磁盘读出后在该世界执行 —— chrome API 全程可用，
- *    顶层初始化不再抛错。Electron 原生世界照旧注入（空壳死代码，无碍）；
- *    纯 DOM 型扩展（源码不引用 chrome.*，如 Eruda）跳过自建世界，避免双重执行。
+ *    顶层初始化不再抛错。manifest 的 content_scripts 已被宿主清空（根源方案：
+ *    Chromium 152 原生副本非空壳，sync 调用抛错 + 与自建世界双份竞争），原生
+ *    世界不再有任何副本 —— 自建世界全量接管 js 执行与 css 注入；
+ *    时序折衷：原生 document_start 型脚本统一在 dom-ready 后执行。
  *
  * 时序：世界由宿主创建、CS 由宿主执行 —— 没有竞速问题；同进程导航会话不断开
  * （frameNavigated 换 frameId 后重建世界），跨进程导航/页签销毁由 detach 事件
@@ -498,22 +500,14 @@ class CsPageSession {
 
     private async installExt(ext: ICsExtInfo): Promise<void> {
         if (this.contentWorlds.has(ext.electronId) && this.ran.has(ext.electronId)) return;
-        // 只把「源码引用 chrome.*」的内容脚本搬进自建世界：纯 DOM 型扩展
-        // （Eruda 等）在原生世界本来就正常，重复执行会出双份 UI
+        // 全量接管：原生 manifest 的 content_scripts 已被 neutralizeNativeContentScripts
+        // 清空（原生不再注入任何副本），所有 content script 都由本世界执行。
+        // 时机折衷：原生 document_start 的脚本统一在 dom-ready 后执行 —— 对
+        // Clip（idle）/Eruda（手动）无影响；若未来有依赖 start 时序的扩展再行适配。
         const groups = (ext.contentScripts || []).filter((cs) =>
             (cs.matches || []).some((p) => matchesUrlPattern(p, this.pageUrl))
         );
         if (groups.length === 0) return;
-        const needsCsRt = groups.some((cs) =>
-            (cs.js || []).some((f) => {
-                try {
-                    return /chrome\s*\.\s*(runtime|storage|tabs|i18n|contextMenus)/.test(this.host.readFile(ext.path, f));
-                } catch {
-                    return false;
-                }
-            })
-        );
-        if (!needsCsRt) return;
 
         let ctxId = this.contentWorlds.get(ext.electronId);
         if (!ctxId) {
@@ -540,6 +534,22 @@ class CsPageSession {
             }
         }
         if (this.ran.has(ext.electronId)) return;
+        // CSS 注入：原生注入渠道已移除，manifest 声明的 css 由这里补上
+        //（style 标签进文档，世界与页面共享 DOM；同文档只注一次，随 ran 守卫幂等）
+        for (const cs of groups) {
+            for (const f of cs.css || []) {
+                try {
+                    const css = this.host.readFile(ext.path, f);
+                    await this.send("Runtime.evaluate", {
+                        expression: `(function(){var s=document.createElement("style");s.setAttribute("data-sy-ext-css",${JSON.stringify(ext.electronId)});s.textContent=${JSON.stringify(css)};(document.head||document.documentElement).appendChild(s);})()`,
+                        contextId: ctxId,
+                        returnByValue: false,
+                    });
+                } catch (e: any) {
+                    console.warn(`[browser-plugin] cs-runtime: "${ext.name}" CSS 注入失败 ${f}:`, e?.message || e);
+                }
+            }
+        }
         // 执行内容脚本入口（源码来自磁盘；世界是我们建的，不存在重声明冲突）
         const errors: string[] = [];
         for (const cs of groups) {

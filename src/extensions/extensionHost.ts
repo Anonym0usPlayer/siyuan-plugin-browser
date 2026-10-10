@@ -151,6 +151,7 @@ export class ExtensionHost {
         this.backfillManifestExtras();
         await this.backfillI18nNames();
         await this.injectBackgroundShims();
+        await this.neutralizeNativeContentScripts();
         // Electron 的 session 扩展不跨重启持久化，启动时全部恢复（原生优先，失败回退垫片）
         await this.reconcileNative();
         this.loaded = true;
@@ -506,6 +507,59 @@ export class ExtensionHost {
     }
 
     /**
+     * 根源方案：清空原生加载扩展 manifest 的 content_scripts（磁盘重写）。
+     *
+     * 动机：session.loadExtension 会让 Chromium 向每个页面的原生 isolated world
+     * 注入一份 content script 副本。Chromium 152 起该副本不再是"空壳死代码"——
+     * chrome.storage.sync **调用**即抛 `"sync" is not available in this instance
+     * of Chrome`，runtime.sendMessage 报 Receiving end，且副本会初始化自己的
+     * UI/状态机（与自建世界副本形成双份竞争，如 Clip 的 tip 状态卡死）。
+     * 事后消音（unhandledrejection/error 事件）永远晚于副本顶层执行，且治标不治本。
+     *
+     * 做法：manifest.json 的 content_scripts 重写为空数组（原始值备份到
+     * manifest.orig.json，installFromPath 重装时会先恢复）→ Chromium 原生不再
+     * 注入任何副本 → 报错源头消失。功能不受影响：cs-runtime 自建世界本来就
+     * 独立从磁盘读 content script 文件执行（extensions.json 的 contentScripts
+     * 记录在安装时解析，与磁盘 manifest 解耦）。
+     *
+     * 幂等：content_scripts 已空则跳过；扩展更新覆盖 manifest 后会重新清空。
+     */
+    private async neutralizeNativeContentScripts(): Promise<void> {
+        const { fs, path } = nodeModules();
+        let changed = false;
+        for (const ext of this.extensions) {
+            if (!ext.enabled) continue;
+            try {
+                const manifestPath = path.join(ext.path, "manifest.json");
+                const origPath = path.join(ext.path, "manifest.orig.json");
+                const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+                const groups = manifest.content_scripts || [];
+                if (groups.length === 0) continue;
+                // 原始 manifest 只在首次清空时备份（此后 manifest 已无 CS，避免
+                // 用清空版覆盖备份）
+                if (!fs.existsSync(origPath)) {
+                    fs.writeFileSync(origPath, JSON.stringify(manifest, null, 2), "utf8");
+                }
+                manifest.content_scripts = [];
+                fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2), "utf8");
+                changed = true;
+            } catch {
+                // 单个扩展失败不影响其它
+            }
+        }
+        if (changed) {
+            // 已加载的原生扩展需要卸掉重载才会按新 manifest 运行；
+            // reconcileNative（紧随其后调用）发现原生缺席会重新 loadExtension
+            const ses = remoteSession();
+            if (ses?.getAllExtensions && ses.unloadExtension) {
+                for (const x of ses.getAllExtensions()) {
+                    try { ses.unloadExtension(x.id); } catch {}
+                }
+            }
+        }
+    }
+
+    /**
      * 给旧版本安装的扩展补齐 popupPath / actionTitle / iconPath。
      * 这三个字段是工具栏图标功能加的，只在安装时从 manifest 解析；
      * 存量数据里没有，读盘时按需补算，否则工具栏永远空白。
@@ -661,7 +715,14 @@ export class ExtensionHost {
         const { fs, path, os } = nodeModules();
         let dir = this.expandPath(rawDir);
         try {
-            const manifestPath = path.join(dir, "manifest.json");
+            // neutralizeNativeContentScripts 清空过 manifest 的扩展：先从备份恢复
+            // 原始 manifest，保证重装时 contentScripts 记录完整（load 随后会再次清空）
+            const origManifest = path.join(dir, "manifest.orig.json");
+            const liveManifest = path.join(dir, "manifest.json");
+            if (fs.existsSync(origManifest)) {
+                try { fs.copyFileSync(origManifest, liveManifest); } catch {}
+            }
+            const manifestPath = liveManifest;
             if (!fs.existsSync(manifestPath)) {
                 return { ok: false, error: "manifest.json not found: " + dir };
             }
