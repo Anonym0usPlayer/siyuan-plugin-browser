@@ -36,8 +36,11 @@ const BRIDGE_NAME = "__syExtHost";
 /** popup/options 页专属世界前缀（独立于 content 世界，避免顶层声明冲突） */
 const POPUP_WORLD_PREFIX = "__syCsPop_";
 
-/** SW→CS 回程监听窗口时长（routeSendMessage 派发后轮询 SW 垫片 outbox 的时间上限） */
-const SW_REPLY_WINDOW_MS = 45_000;
+/** SW→CS 回程监听窗口时长（routeSendMessage 派发后轮询 SW 垫片 outbox 的时间上限）。
+ *  剪藏大流程（多图下载）可远超 45s 且中途可能无 tip → 窗口必须覆盖全程，
+ *  否则最后的完成 tip（tip_clip_ok）在窗口关闭后进 outbox 无人接驳，tip 永卡
+ *  "剪藏中"。空转开销 = 每 600ms 一次轻量 drain（有消息时经活跃续期顺延）。 */
+const SW_REPLY_WINDOW_MS = 120_000;
 /** 取走 SW 垫片 v13 __syTabsOutbox 里待发往 content 世界的消息（原子取走） */
 const SW_TABS_DRAIN_EXPR = `(() => { const out = self.__syTabsOutbox || []; self.__syTabsOutbox = []; return JSON.stringify(out); })()`;
 
@@ -292,6 +295,8 @@ class CsPageSession {
     private ctxToExt = new Map<number, string>();
     /** SW→CS 回程泵（electronId → 轮询状态）：routeSendMessage 派发后限时运行 */
     private swReplyPumps = new Map<string, { deadline: number; busy: boolean; timer: ReturnType<typeof setInterval> }>();
+    /** 大消息分块缓冲：id → 分块数组（binding 通道挂大 payload，CS 切块过桥、此处拼装） */
+    private bigMsgBuffers = new Map<string, { parts: (string | null)[]; received: number; total: number; ts: number }>();
 
     constructor(
         private wc: any,
@@ -368,7 +373,9 @@ class CsPageSession {
                             res.on("error", () => done({ status: 0, bodyText: "" }));
                         }
                     );
-                    rq.setTimeout(30000, () => {
+                    // 20s：route 内部等待须 < 桥超时 25s —— 内核慢响应在此转为
+                    // status 0（CS 侧按请求失败处理），避免顶爆桥产生假超时
+                    rq.setTimeout(20000, () => {
                         try { rq.destroy(); } catch (e) {}
                         done({ status: 0, bodyText: "" });
                     });
@@ -694,18 +701,41 @@ class CsPageSession {
             const r = await this.kernelFetchNode(url, method, headers, body);
             return { data: r };
         }
+        if (req.type === "bigmsg-chunk") {
+            // 大消息分块接收：binding 通道挂大 payload，CS 侧把大 JSON 切 <400KB 块
+            // 逐次过桥，这里按 id 拼装进内存缓冲，sendmessage-big 时取走拼装。
+            // 缓冲 5 分钟自动回收（发送方崩溃/放弃时防泄漏）。
+            const id = String(args.id || "");
+            const total = Number(args.total || 0);
+            if (!id || !(total > 0)) return { err: "bad bigmsg chunk" };
+            let buf = this.bigMsgBuffers.get(id);
+            if (!buf) {
+                buf = { parts: new Array(total).fill(null), received: 0, total, ts: Date.now() };
+                this.bigMsgBuffers.set(id, buf);
+                const now = Date.now();
+                for (const [k, b] of this.bigMsgBuffers) {
+                    if (now - b.ts > 5 * 60_000) this.bigMsgBuffers.delete(k);
+                }
+            }
+            const idx = Number(args.idx || 0);
+            if (idx >= 0 && idx < buf.total && !buf.parts[idx]) {
+                buf.parts[idx] = String(args.data || "");
+                buf.received++;
+            }
+            return { data: { received: buf.received, total: buf.total } };
+        }
         if (req.type === "sendmessage-big") {
-            // 大消息：content 世界已把完整 payload 存入 chrome.storage.local（binding
-            // 字符串通道挂大 payload），这里从 SW 的真实 storage 读回 → 走常规路由
-            const r1 = await this.evalInSw(
-                ext,
-                `(async () => JSON.stringify((await chrome.storage.local.get("__syBigMsg"))["__syBigMsg"] ?? null))()`
-            );
+            // 大消息：从内存缓冲拼装（CS 经 bigmsg-chunk 分块送达）→ 走常规路由
+            const buf = this.bigMsgBuffers.get(String(args.id || ""));
+            if (!buf) return { err: "big message buffer missing" };
+            this.bigMsgBuffers.delete(String(args.id || ""));
             let bigMsg: any = null;
-            try { bigMsg = JSON.parse(String(r1.value ?? "null")); } catch {}
-            const out = await this.routeSendMessage(ext, { msg: bigMsg, senderUrl: String(args.senderUrl || "") });
-            await this.evalInSw(ext, `chrome.storage.local.remove("__syBigMsg")`).catch(() => null);
-            return out;
+            try {
+                bigMsg = JSON.parse(buf.parts.map((p) => p ?? "").join(""));
+            } catch {
+                return { err: "big message assemble failed" };
+            }
+            return await this.routeSendMessage(ext, { msg: bigMsg, senderUrl: String(args.senderUrl || "") });
         }
         if (req.type === "sendmessage") {
             return await this.routeSendMessage(ext, args);
@@ -785,6 +815,11 @@ class CsPageSession {
             }
             let reqs: any[] = [];
             try { reqs = JSON.parse(String(r.value ?? "[]")) || []; } catch {}
+            if (reqs.length > 0) {
+                // SW 仍在产生回程消息（剪藏大流程可持续超过单窗口期）→ 顺延监听窗口，
+                // 保证 tip 流转全程有泵接驳（卡"剪藏中"的根源之一是窗口先于流程结束）
+                entry.deadline = Date.now() + SW_REPLY_WINDOW_MS;
+            }
             for (const req of reqs) {
                 if (!req || typeof req.id !== "string") continue;
                 const out = await this.dispatchToContentWorld({ electronId } as ICsExtInfo, {
@@ -831,7 +866,9 @@ class CsPageSession {
                     clearTimeout(timer);
                     resolve(JSON.stringify(v === undefined ? null : v));
                 };
-                const timer = setTimeout(() => finish(null), 25000);
+                // 20s：宿主 route 内部等待须 < 桥超时 25s（sendmessage/big 的
+                // handler 挂起兜底；剪藏大流程的进度走 SW→CS 回程 tip，不依赖此响应）
+                const timer = setTimeout(() => finish(null), 20000);
                 let asyncWait = false;
                 const sendResponse = (resp) => finish(resp);
                 // handler 返回 Promise（async 函数）→ 等其 resolve 作为响应（此前直接丢弃 → 应用收到 undefined 而崩）
@@ -1034,7 +1071,9 @@ class CsPageSession {
                             clearTimeout(timer);
                             resolve(JSON.stringify(v === undefined ? null : v));
                         };
-                        const timer = setTimeout(() => finish(null), 25000);
+                        // 20s：宿主 route 内部等待须 < 桥超时 25s（留 5s 给回写与传输），
+                        // 否则宿主还在等、CS 端桥先断（假超时 Uncaught，响应实际已在途）
+                        const timer = setTimeout(() => finish(null), 20000);
                         let asyncWait = false;
                         const sendResponse = (resp) => finish(resp);
                         // handler 返回 Promise（async 函数）→ 等其 resolve 作为响应
@@ -1062,7 +1101,7 @@ class CsPageSession {
                 returnByValue: true,
                 awaitPromise: true,
             },
-            30000
+            22000 // 内部 expr 兜底 20s + evaluate 传输余量；须 < 桥超时 25s
         );
         if ((r as any)?.exceptionDetails) {
             return { err: String((r as any).exceptionDetails?.exception?.description || "content world 派发异常").slice(0, 200) };
@@ -1406,20 +1445,30 @@ function buildShim(ext: ICsExtInfo, messages: Record<string, any>): string {
         }
         return p;
     }
-    // 大消息（如 upload-copy：整页 DOM + 图片 base64，可达数 MB）不能走 binding
-    // 字符串通道（实测大 payload 挂死）—— 存 chrome.storage.local 由宿主读回。
-    // storage 是 CS 与 SW 都真实可用的通道，MB 级容量足够。
+    // 大消息（如 upload-copy：整页 DOM + 图片 base64，可达数 MB）既不能单次走
+    // binding（实测大 payload 挂死），也不能经 chrome.storage 绕行 —— CS 世界的
+    // storage 本身就走 binding（同一条会挂死的通道，旧方案此处即 25s 桥超时）。
+    // 根源方案：把大 JSON 切成 <400KB 的小块逐次过 binding（单块实测安全），
+    // 宿主内存拼装后走常规路由（见宿主 route 的 bigmsg-chunk / sendmessage-big）。
     function sendMessageShim(msg, cb) {
         var senderUrl = String(location.href).slice(0, 300);
         var json = null;
         try { json = JSON.stringify(msg === undefined ? null : msg); } catch (e) {}
         if (json && json.length > 600000) {
-            return cbStyle(
-                chrome.storage.local.set({ __syBigMsg: json }).then(function () {
-                    return hostCall("sendmessage-big", { senderUrl: senderUrl });
-                }),
-                cb
-            );
+            var bid = "b" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+            var CHUNK = 400000;
+            var total = Math.ceil(json.length / CHUNK);
+            var p = Promise.resolve();
+            for (var i = 0; i < total; i++) {
+                (function (idx, piece) {
+                    p = p.then(function () {
+                        return hostCall("bigmsg-chunk", { id: bid, idx: idx, total: total, data: piece });
+                    });
+                })(i, json.slice(i * CHUNK, (i + 1) * CHUNK));
+            }
+            return cbStyle(p.then(function () {
+                return hostCall("sendmessage-big", { id: bid, senderUrl: senderUrl });
+            }), cb);
         }
         return cbStyle(hostCall("sendmessage", { msg: msg === undefined ? null : msg, senderUrl: senderUrl }), cb);
     }
@@ -1493,6 +1542,10 @@ function buildShim(ext: ICsExtInfo, messages: Record<string, any>): string {
     var chrome_ = {};
     chrome_.runtime = {
         id: EXT.id,
+        // lastError 是 callback 风格 API 的错误检查口：本实现全 promise 化
+        //（错误走 reject），恒为 undefined —— 显式预置，避免扩展代码访问时
+        // 掉进通用桩代理（[sy-ext-shim] chrome.runtime.lastError 未实现 warn）
+        lastError: undefined,
         getManifest: function () { return { manifest_version: 3, name: EXT.name, version: EXT.version }; },
         getURL: function (p) { return "chrome-extension://" + EXT.id + "/" + String(p || "").replace(/^\\//, ""); },
         onMessage: (function () {
@@ -1558,6 +1611,7 @@ function buildShim(ext: ICsExtInfo, messages: Record<string, any>): string {
     };
     function storageArea(area) {
         return {
+            lastError: undefined,
             get: traced(area + ".get", function (keys, cb) { return cbStyle(hostCall("storage", { op: "get", area: area, payload: keys === undefined ? null : keys }), cb); }),
             set: traced(area + ".set", function (items, cb) { return cbStyle(hostCall("storage", { op: "set", area: area, payload: items === undefined ? {} : items }), cb); }),
             remove: traced(area + ".remove", function (keys, cb) { return cbStyle(hostCall("storage", { op: "remove", area: area, payload: keys === undefined ? [] : keys }), cb); }),
@@ -1613,6 +1667,7 @@ function buildShim(ext: ICsExtInfo, messages: Record<string, any>): string {
     };
     if (!chrome_.tabs) {
         chrome_.tabs = {
+            lastError: undefined,
             // popup 的"当前标签"就是它所在的页面
             query: function (q, cb) {
                 var tab = { id: 1, index: 0, windowId: 1, active: true, highlighted: true, pinned: false, incognito: false, url: String(location.href), title: document.title };
