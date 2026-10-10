@@ -82,6 +82,14 @@ export function disposeCsRuntime(webview: IWebviewTag): void {
     manager?.disposeFor(webview);
 }
 
+/** 把当前内核地址与 API token 播种到 SiYuan Clip 扩展配置（SW storage.local 的 ip/token）：
+ *  每个工作空间内核端口与 token 各不相同，扩展里的静态配置必然失效 —— 宿主按当前
+ *  内核真实值自动填充，其余配置项不动；值已一致时跳过写（幂等，减少 onChanged 噪音）。 */
+export function seedExtensionKernelSettings(): Promise<void> {
+    if (!manager) return Promise.resolve();
+    return manager.seedExtensionKernelSettings();
+}
+
 /** popup eval 轨迹（主窗口可读；用于判断是否所有脚本落在同一个世界） */
 function traceEval(entry: { ctxId: number; len: number; ok: boolean; err?: string }): void {
     try {
@@ -262,7 +270,10 @@ class CsRuntimeManager {
         }
     }
 
-    /** manager 级 SW eval：任一存活会话（HTTP→flat 双通道）→ 主窗口兜底 */
+    /** manager 级 SW eval：任一存活会话（HTTP→flat 双通道）→ 主窗口兜底。
+     *  兜底必须带 wake：load 时段通常没有任何 webview 会话，且 loadExtension
+     *  不自动拉起 MV3 SW —— 无唤醒的主窗口兜底在 SW 未运行时永远查不到
+     *  target（实测内核地址播种 10 轮重试全败的根因）。 */
     async evalInSwAny(electronId: string, expr: string): Promise<{ value?: any; err?: string }> {
         for (const s of this.sessions.values()) {
             if (!s.alive) continue;
@@ -270,7 +281,53 @@ class CsRuntimeManager {
             if (r.err !== SW_FLAT_UNAVAILABLE || r.value !== undefined) return r;
             // 该会话两条通道都不可用 → 换下一个
         }
-        return await evalInSwViaMainWindow(electronId, expr);
+        return await evalInSwViaMainWindow(electronId, expr, async () => {
+            try { await this.host.wakeSw?.(electronId); } catch {}
+        });
+    }
+
+    /** 播种当前内核地址/token 到 SiYuan Clip 配置（SW storage.local 的 ip/token）：
+     *  每个工作空间端口与 token 不同，静态配置必然失效 —— 按当前内核真实值填充；
+     *  值已一致时跳过写。启动时 SW 冷启动窗口期内首次写入可能全链失败 →
+     *  3s 间隔退避重试（最多 10 次），成功即止。 */
+    async seedExtensionKernelSettings(): Promise<void> {
+        const port = window.location.port;
+        if (!port) return;
+        const ip = "http://127.0.0.1:" + port;
+        let token = "";
+        try { token = String((window as any).siyuan?.config?.api?.token || ""); } catch {}
+        for (let attempt = 0; attempt < 10; attempt++) {
+            try {
+                const clip = this.host.listNativeExts().find((e) => e.name === "SiYuan");
+                if (clip) {
+                    // loadExtension 不自动拉起 MV3 SW —— 写入前先无副作用唤醒
+                    //（startWorkerForScope；SW 已运行时为 no-op）
+                    await this.host.wakeSw?.(clip.electronId);
+                    const expr = `(async () => {
+                        const cur = await chrome.storage.local.get(["ip", "token"]);
+                        const patch = {};
+                        const wantIp = ${JSON.stringify(ip)};
+                        const wantToken = ${JSON.stringify(token)};
+                        if (cur.ip !== wantIp) patch.ip = wantIp;
+                        if (wantToken && cur.token !== wantToken) patch.token = wantToken;
+                        if (Object.keys(patch).length) await chrome.storage.local.set(patch);
+                        return JSON.stringify({ changed: Object.keys(patch).length > 0 });
+                    })()`;
+                    const r = await this.evalInSwAny(clip.electronId, expr);
+                    if (!r.err) {
+                        console.log("[browser-plugin] seed kernel settings ok (attempt", attempt + 1 + "):", String(r.value || ""));
+                        return;
+                    }
+                    console.warn("[browser-plugin] seed attempt", attempt + 1, "err:", String(r.err).slice(0, 160));
+                } else {
+                    console.warn("[browser-plugin] seed attempt", attempt + 1, ": SiYuan 扩展未就绪");
+                }
+            } catch (e: any) {
+                console.warn("[browser-plugin] seed attempt", attempt + 1, "exception:", String(e?.message || e).slice(0, 160));
+            }
+            await new Promise((res) => setTimeout(res, 3000));
+        }
+        console.warn("[browser-plugin] seed kernel settings: 10 轮重试全部失败（ip=" + ip + "）");
     }
 
     /** manager 级 isolated world 直调：为该 webview 取会话走 flat 通道 */
@@ -1334,7 +1391,7 @@ class CsPageSession {
 }
 
 /** 主窗口 debugger 兜底（webview 会话不可用时；attach 与 DevTools 互斥，用完即 detach） */
-async function evalInSwViaMainWindow(electronId: string, expr: string): Promise<{ value?: any; err?: string }> {
+async function evalInSwViaMainWindow(electronId: string, expr: string, wake?: () => Promise<void>): Promise<{ value?: any; err?: string }> {
     let attachedHere = false;
     try {
         const req = (window as any).require;
@@ -1351,7 +1408,7 @@ async function evalInSwViaMainWindow(electronId: string, expr: string): Promise<
                 dbg.sendCommand(method, params, sessionId),
                 new Promise((_, reject) => setTimeout(() => reject(new Error(`CDP ${method} 超时`)), 12000)),
             ]);
-        return await evalInSwFlat(sender, electronId, expr);
+        return await evalInSwFlat(sender, electronId, expr, wake);
     } catch (e: any) {
         // attach 失败（如用户开着 DevTools）按通道不可用处理
         void e;

@@ -2,7 +2,7 @@ import { Dialog, showMessage } from "siyuan";
 import type { IWebviewTag } from "../types";
 import { parseExtensionPackage } from "./crx";
 import { EDGE_ADDONS_HOME, downloadEdgeCrx, fetchEdgeAddonMeta, parseEdgeAddonId } from "./edgeStore";
-import { disposeCsRuntime, ensureCsRuntime, initCsRuntime } from "./cs-runtime";
+import { disposeCsRuntime, ensureCsRuntime, initCsRuntime, seedExtensionKernelSettings } from "./cs-runtime";
 import { remoteSession } from "../utils/electron";
 
 /**
@@ -160,6 +160,8 @@ export class ExtensionHost {
         try {
             window.dispatchEvent(new CustomEvent("sy-browser-ext-host-loaded"));
         } catch {}
+        // 内核地址/token 自动填充（SiYuan Clip 配置播种）：不阻塞，失败下次启动重试
+        void seedExtensionKernelSettings();
     }
 
     /**
