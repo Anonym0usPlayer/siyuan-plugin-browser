@@ -195,3 +195,149 @@ export async function triggerExtensionMenuClick(
         return { ok: false, error: String(e?.message || e) };
     }
 }
+
+// ===== isolated world 直调（绕过 Electron 缺失的 SW↔CS 消息路由） =====
+
+/**
+ * 在扩展 content script 的 isolated world 上下文里执行表达式。
+ *
+ * 这是 SW↔CS 消息路由缺失时的替代通道：Runtime.enable 会把页面里所有
+ * execution context（含各扩展的 isolated world）广播出来，按 origin 匹配
+ * chrome-extension://<electronId> 拿到 contextId，再带 contextId evaluate ——
+ * 直接运行在 content script 的世界里，与它的变量/函数零距离。
+ */
+export async function evalInExtensionWorld(
+    pageWebview: IWebviewTag,
+    electronId: string,
+    expr: string,
+): Promise<{ ok: boolean; value?: any; error?: string; contextId?: number }> {
+    const pageUrl = (() => {
+        try { return pageWebview.getURL(); } catch { return ""; }
+    })();
+    // webview 元素不是 CDP target；从 /json/list 按 URL 找对应页面 target
+    let page: any = null;
+    try {
+        const targets = await fetchTargets();
+        const norm = (u: string) => String(u || "").split("#")[0];
+        page = targets.find((t) => t.type === "webview" && norm(t.url) === norm(pageUrl))
+            || targets.find((t) => t.type === "webview" && pageUrl && norm(t.url) === norm(pageUrl.split("?")[0]));
+    } catch (e: any) {
+        return { ok: false, error: e.message };
+    }
+    if (!page) return { ok: false, error: "未找到页面 CDP target" };
+
+    return new Promise((resolve) => {
+        let ws: WebSocket;
+        try {
+            ws = new WebSocket(page.webSocketDebuggerUrl);
+        } catch (e: any) {
+            resolve({ ok: false, error: `WebSocket 失败: ${String(e?.message || e)}` });
+            return;
+        }
+        let s = 0;
+        const pending = new Map<number, (r: any) => void>();
+        let extContextId: number | null = null;
+        ws.onmessage = (ev) => {
+            let m: any;
+            try { m = JSON.parse(String(ev.data)); } catch { return; }
+            if (m.method === "Runtime.executionContextCreated") {
+                const c = m.params?.context || {};
+                const origin = String(c.origin || "");
+                // isolated 标记在 auxData.type，c.type 在部分 Chromium 版本上为空（实测踩过）
+                const isIsolated = c.type === "isolated" || (c.auxData && c.auxData.type === "isolated");
+                if (isIsolated && origin.includes(electronId)) {
+                    extContextId = c.id;
+                }
+            }
+            if (m.id && pending.has(m.id)) {
+                const fn = pending.get(m.id);
+                pending.delete(m.id);
+                fn?.(m);
+            }
+        };
+        const finish = (v: any) => {
+            clearTimeout(timer);
+            try { ws.close(); } catch {}
+            resolve(v);
+        };
+        const send = (method: string, params: any = {}) => new Promise<any>((res) => {
+            const i = ++s;
+            pending.set(i, res);
+            ws.send(JSON.stringify({ id: i, method, params }));
+        });
+        const timer = setTimeout(() => finish({ ok: false, error: "CDP 会话超时" }), 10000);
+        ws.onopen = async () => {
+            try {
+                await send("Runtime.enable");
+                // 上下文事件可能未及时到达，重试等待
+                for (let i = 0; i < 10 && extContextId === null; i++) {
+                    await new Promise((r2) => setTimeout(r2, 200));
+                }
+                if (extContextId === null) {
+                    finish({ ok: false, error: "该页面没有此扩展的 isolated world（content script 未注入？）" });
+                    return;
+                }
+                const r = await send("Runtime.evaluate", { expression: expr, returnByValue: true, awaitPromise: true, contextId: extContextId });
+                if (r.result?.exceptionDetails) {
+                    finish({ ok: false, error: String(r.result.exceptionDetails?.exception?.description || r.result.exceptionDetails.text || "isolated world 执行异常").slice(0, 300), contextId: extContextId });
+                } else {
+                    finish({ ok: true, value: r.result?.result?.value, contextId: extContextId });
+                }
+            } catch (e: any) {
+                finish({ ok: false, error: String(e?.message || e) });
+            }
+        };
+        ws.onerror = () => finish({ ok: false, error: "WebSocket 连接失败" });
+    });
+}
+
+/**
+ * 把"CS↔SW 消息路由垫片"注入到扩展的 isolated world：
+ * 替换 chrome.runtime.sendMessage 为 storage 桥（写 __syRouteIn 请求、
+ * 监听 __syRouteResp_<id> 回包），与 SW 侧垫片 v4 的 onMessage 路由配对。
+ * 幂等（__syShim 标记）；原生路由不通是前提，替换无副作用。
+ */
+export async function installMessageRouteShim(
+    pageWebview: IWebviewTag,
+    electronId: string,
+): Promise<{ ok: boolean; error?: string }> {
+    const r = await evalInExtensionWorld(
+        pageWebview,
+        electronId,
+        `(() => {
+            try {
+                if (!chrome.runtime || !chrome.runtime.sendMessage) return { err: "no runtime.sendMessage" };
+                if (chrome.runtime.sendMessage.__syShim) return { already: true };
+                var shim = function (msg, callback) {
+                    var reqId = "r" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+                    var item = {};
+                    item.__syRouteIn = { reqId: reqId, msg: msg === undefined ? null : msg, sender: { url: String(location.href).slice(0, 300) } };
+                    chrome.storage.local.set(item);
+                    if (typeof callback !== "function") return;
+                    var listener = function (changes, area) {
+                        if (area !== "local") return;
+                        var key = "__syRouteResp_" + reqId;
+                        if (changes[key]) {
+                            chrome.storage.onChanged.removeListener(listener);
+                            var resp = changes[key].newValue ? changes[key].newValue.resp : undefined;
+                            try { callback(resp); } catch (e) {}
+                            chrome.storage.local.remove(key);
+                        }
+                    };
+                    chrome.storage.onChanged.addListener(listener);
+                    setTimeout(function () { chrome.storage.onChanged.removeListener(listener); try { callback(undefined); } catch (e) {} }, 15000);
+                };
+                shim.__syShim = true;
+                try {
+                    Object.defineProperty(chrome.runtime, "sendMessage", { configurable: true, get: function () { return shim; } });
+                } catch (e) {
+                    chrome.runtime.sendMessage = shim;
+                }
+                return { installed: true };
+            } catch (e) { return { err: String(e && e.stack || e).slice(0, 300) }; }
+        })()`,
+    );
+    if (!r.ok) return { ok: false, error: r.error };
+    if (r.value && r.value.err) return { ok: false, error: String(r.value.err) };
+    return { ok: true };
+}

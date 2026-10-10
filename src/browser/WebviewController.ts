@@ -277,6 +277,9 @@ export class WebviewController {
                 isEditable: e.params?.isEditable ?? false,
             };
             e.preventDefault?.();
+            // 右键上下文留存：扩展菜单项（如剪藏"复制到思源"）需要 srcURL
+            this.lastCtxSrcUrl = params.srcURL || undefined;
+            this.lastCtxPageUrl = params.pageURL || this.webview.getURL();
             showWebViewContextMenu(this.webview, params, this.i18n, {
                 openInNewTab: (url) => this.callbacks.onOpenNewTab(url),
                 saveAs: (url, name) => this.callbacks.onSaveAs(url, name),
@@ -293,6 +296,10 @@ export class WebviewController {
     /** 扩展右键菜单项：BrowserTab 注入（缓存读取）与点击回调 */
     private extMenuProvider?: () => Array<{ id: string; title: string; electronId: string; extPath: string }>;
     private onExtMenuItem?: (item: { id: string; title: string; electronId: string; extPath: string }) => void;
+
+    /** 最近一次右键的图片地址 / 页面地址（扩展剪藏项用） */
+    lastCtxSrcUrl?: string;
+    lastCtxPageUrl?: string;
 
     setExtensionMenuSource(
         provider: () => Array<{ id: string; title: string; electronId: string; extPath: string }>,

@@ -172,7 +172,7 @@ export class ExtensionHost {
      */
     private injectBackgroundShims(): void {
         const { fs, path } = nodeModules();
-        const SHIM_MARK = "/* sy-bg-shim:v3 */";
+        const SHIM_MARK = "/* sy-bg-shim:v4 */";
         let changedShimCount = 0;
         for (const ext of this.extensions) {
             try {
@@ -257,6 +257,60 @@ export class ExtensionHost {
                 });
             }
         }
+        // 3) runtime.onMessage 路由（CS→SW 方向的通用替代）：
+        //    Electron 没实现 SW↔CS 消息路由（SW 的 tabs.sendMessage 恒报
+        //    "Receiving end does not exist"，CS 的 runtime.sendMessage 同理静默丢失）。
+        //    这里包装 onMessage.addListener 收集扩展注册的 handlers，
+        //    配合 storage 通道（__syRouteIn 请求 / __syRouteResp_<id> 响应）
+        //    用官方 chrome.storage 实现两端路由 —— storage 在 CS 和 SW 里
+        //    都是真实可用的（实测）。CS 侧的发送端 shim 由 sw-bridge 经 CDP
+        //    注入到扩展的 isolated world。
+        try {
+            if (chrome.runtime && chrome.runtime.onMessage && !chrome.runtime.onMessage.__syWrapped) {
+                var omFns = [];
+                var omWrapped = {
+                    addListener: function (fn) { if (typeof fn === "function") omFns.push(fn); },
+                    removeListener: function (fn) { var i = omFns.indexOf(fn); if (i >= 0) omFns.splice(i, 1); },
+                };
+                Object.defineProperty(chrome.runtime, "onMessage", {
+                    configurable: true,
+                    get: function () { return omWrapped; },
+                });
+                omWrapped.__syWrapped = true;
+                self.__syOnMessageHandlers = omFns;
+                if (chrome.storage && chrome.storage.onChanged) {
+                    chrome.storage.onChanged.addListener(function (changes, area) {
+                        try {
+                            if (area !== "local" || !changes.__syRouteIn || !changes.__syRouteIn.newValue) return;
+                            var env = changes.__syRouteIn.newValue;
+                            if (!env || typeof env.reqId === "undefined") return;
+                            var responded = false;
+                            var sendResponse = function (resp) {
+                                if (responded) return;
+                                responded = true;
+                                var key = "__syRouteResp_" + env.reqId;
+                                var item = {};
+                                item[key] = { resp: resp === undefined ? null : resp };
+                                try { chrome.storage.local.set(item); } catch (e) {}
+                            };
+                            var anySync = false;
+                            omFns.forEach(function (fn) {
+                                try {
+                                    var r = fn(env.msg, env.sender || { id: "sy-host" }, sendResponse);
+                                    if (r === true) {
+                                        // handler 返回 true 表示异步 sendResponse，等待其回调
+                                    } else if (r !== undefined) {
+                                        anySync = true;
+                                        sendResponse(r);
+                                    }
+                                } catch (e) {}
+                            });
+                            if (!anySync && omFns.length === 0) sendResponse(undefined);
+                        } catch (e) {}
+                    });
+                }
+            }
+        } catch (e) {}
     } catch (e) {}
 })();
 `;
