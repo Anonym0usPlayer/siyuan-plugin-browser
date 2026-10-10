@@ -126,6 +126,8 @@ export class ExtensionHost {
 
     constructor(plugin: any) {
         this.plugin = plugin;
+        // manager 与页面无关，构造即就绪（popup 可在 about:blank 等非 http 页上打开）
+        this.initCsRuntimeOnce();
     }
 
     private readFileCached(extPath: string, rel: string): string {
@@ -944,59 +946,62 @@ export class ExtensionHost {
 
     private csRuntimeInited = false;
 
+    private initCsRuntimeOnce(): void {
+        if (this.csRuntimeInited) return;
+        initCsRuntime({
+            listNativeExts: () =>
+                this.extensions
+                    .filter((e) => e.enabled && e.native && !!e.electronId)
+                    .map((e) => ({
+                        electronId: e.electronId!,
+                        path: e.path,
+                        name: e.name,
+                        version: e.version,
+                        defaultLocale: e.defaultLocale,
+                        contentScripts: e.contentScripts,
+                    })),
+            readFile: (extPath: string, rel: string) => {
+                const { fs, path } = nodeModules();
+                return fs.readFileSync(path.join(extPath, rel), "utf8");
+            },
+            messages: (extPath: string, defaultLocale: string) => {
+                for (const locale of [defaultLocale, "en", "zh_CN"].filter(Boolean)) {
+                    try {
+                        return JSON.parse(this.readFileCached(extPath, `_locales/${locale}/messages.json`));
+                    } catch {}
+                }
+                return {};
+            },
+            wakeOne: async (electronId: string) => {
+                const ses = remoteSession();
+                if (!ses) return null;
+                const ext = this.extensions.find((e) => e.electronId === electronId);
+                if (!ext) return null;
+                try {
+                    ses.removeExtension(electronId);
+                } catch {}
+                try {
+                    const info = await ses.loadExtension(ext.path, { allowFileAccess: true });
+                    if (info?.id && info.id !== electronId) {
+                        // Electron 的扩展 id 与 SW origin 可能跨 load 变化 —— 同步回列表
+                        ext.electronId = info.id;
+                        ext.native = true;
+                        await this.persist();
+                        return info.id;
+                    }
+                    return electronId;
+                } catch {
+                    return null;
+                }
+            },
+        });
+        this.csRuntimeInited = true;
+    }
+
     /** dom-ready 时调用：确保该页签的 CDP 会话与各扩展自建世界就绪 */
     ensureCsRuntime(webview: IWebviewTag): void {
         try {
-            if (!this.csRuntimeInited) {
-                initCsRuntime({
-                    listNativeExts: () =>
-                        this.extensions
-                            .filter((e) => e.enabled && e.native && !!e.electronId)
-                            .map((e) => ({
-                                electronId: e.electronId!,
-                                path: e.path,
-                                name: e.name,
-                                version: e.version,
-                                defaultLocale: e.defaultLocale,
-                                contentScripts: e.contentScripts,
-                            })),
-                    readFile: (extPath: string, rel: string) => {
-                        const { fs, path } = nodeModules();
-                        return fs.readFileSync(path.join(extPath, rel), "utf8");
-                    },
-                    messages: (extPath: string, defaultLocale: string) => {
-                        for (const locale of [defaultLocale, "en", "zh_CN"].filter(Boolean)) {
-                            try {
-                                return JSON.parse(this.readFileCached(extPath, `_locales/${locale}/messages.json`));
-                            } catch {}
-                        }
-                        return {};
-                    },
-                    wakeOne: async (electronId: string) => {
-                        const ses = remoteSession();
-                        if (!ses) return null;
-                        const ext = this.extensions.find((e) => e.electronId === electronId);
-                        if (!ext) return null;
-                        try {
-                            ses.removeExtension(electronId);
-                        } catch {}
-                        try {
-                            const info = await ses.loadExtension(ext.path, { allowFileAccess: true });
-                            if (info?.id && info.id !== electronId) {
-                                // Electron 的扩展 id 与 SW origin 可能跨 load 变化 —— 同步回列表
-                                ext.electronId = info.id;
-                                ext.native = true;
-                                await this.persist();
-                                return info.id;
-                            }
-                            return electronId;
-                        } catch {
-                            return null;
-                        }
-                    },
-                });
-                this.csRuntimeInited = true;
-            }
+            this.initCsRuntimeOnce();
             ensureCsRuntime(webview);
         } catch (e) {
             console.warn("[browser-plugin] ensureCsRuntime failed:", e);

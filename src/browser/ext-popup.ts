@@ -341,22 +341,32 @@ export async function showExtensionPopupInPage(opts: {
     return true;
 })()`;
         const r = await webview.executeJavaScript(runner, false);
-        if (r !== true) return { ok: false, error: "popup 注入失败" };
-        if (useEvalJs) {
-            // 所有脚本打包进单个 IIFE：文件间共享顶层声明（lib 的 const 对 popup.js
-            // 可见），且每次打开都是全新闭包 —— 世界复用时重开不会再撞
-            // "Identifier has already been declared"
-            const bundle =
-                POPUP_JS_PRELUDE +
-                "\n;(function(){\n" +
-                jsSources.join("\n;\n") +
-                "\n})();";
+        const dbg2 = (msg: any) => {
             try {
-                await opts.evalJs(bundle);
-            } catch (e: any) {
-                return { ok: false, error: "popup 脚本执行失败: " + String(e?.message || e).slice(0, 200) };
+                (window as any).__syPopupDbg2 = { ts: Date.now(), popupPath, ...(typeof msg === "object" ? msg : { msg }) };
+            } catch (e) {}
+        };
+        dbg2({ jsCount: jsSources.length, useEvalJs, runnerOk: r === true, htmlLen: html.length });
+        if (r !== true) {
+            dbg2({ ok: false, error: "popup 注入失败" });
+            return { ok: false, error: "popup 注入失败" };
+        }
+        if (useEvalJs) {
+            // 按(html 顺序)逐文件执行 —— 每文件等价于真实浏览器的独立 script 标签
+            // （webpack chunk push → runtime 初始化消化的模式依赖这个语义）。
+            // 重声明问题已由「每次打开新建 popup 世界」根治，无需打包。
+            await opts.evalJs(POPUP_JS_PRELUDE);
+            for (const src of jsSources) {
+                try {
+                    await opts.evalJs(src);
+                } catch (e: any) {
+                    const err = "popup 脚本执行失败: " + String(e?.message || e).slice(0, 200);
+                    dbg2({ ok: false, error: err });
+                    return { ok: false, error: err };
+                }
             }
         }
+        dbg2({ ok: true });
         return { ok: true };
     } catch (e: any) {
         return { ok: false, error: String(e?.message || e) };

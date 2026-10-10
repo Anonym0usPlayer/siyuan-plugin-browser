@@ -171,20 +171,37 @@ class CsRuntimeManager {
     }
 
     async evalPopupJs(webview: IWebviewTag, ext: ICsExtInfo, expr: string): Promise<{ ok: boolean; value?: any; error?: string }> {
-        const pageUrl = safeUrl(webview);
-        if (!/^https?:\/\//i.test(pageUrl)) return { ok: false, error: "非 http(s) 页面" };
-        const wc = remoteWebContents(webview);
-        if (!wc) return { ok: false, error: "webContents 不可用" };
-        const key = String(wc.id);
-        let s = this.sessions.get(key);
-        if (!s || !s.alive) {
-            s = new CsPageSession(wc, pageUrl, this.host, () => this.sessions.delete(key));
-            this.sessions.set(key, s);
-            await s.start();
+        // 页面任意 URL（含 about:blank / data: 查看源代码页）都可承载 popup ——
+        // 传输走 webContents.debugger，与页面类型无关；仅 content script 注入限定 http(s)
+        const dbg = (msg: any) => {
+            try {
+                (window as any).__syPopupDbg = { ts: Date.now(), ext: ext.name, ...(typeof msg === "object" ? msg : { msg }) };
+            } catch (e) {}
+        };
+        try {
+            const wc = remoteWebContents(webview);
+            if (!wc) {
+                dbg({ ok: false, error: "webContents 不可用" });
+                return { ok: false, error: "webContents 不可用" };
+            }
+            const pageUrl = safeUrl(webview);
+            const key = String(wc.id);
+            let s = this.sessions.get(key);
+            if (!s || !s.alive) {
+                s = new CsPageSession(wc, pageUrl, this.host, () => this.sessions.delete(key));
+                this.sessions.set(key, s);
+                await s.start();
+            }
+            s.pageUrl = pageUrl;
+            const ctxId = await s.ensurePopupWorld(ext);
+            const r = await s.evaluateInWorld(ctxId, expr);
+            dbg({ ...r, ctxId });
+            return r;
+        } catch (e: any) {
+            const err = String(e?.message || e);
+            dbg({ ok: false, error: err });
+            return { ok: false, error: err };
         }
-        s.pageUrl = pageUrl;
-        const ctxId = await s.ensurePopupWorld(ext);
-        return s.evaluateInWorld(ctxId, expr);
     }
 }
 
@@ -193,8 +210,8 @@ class CsPageSession {
     private frameId: string | null = null;
     /** electronId → content 世界 contextId（跑内容脚本） */
     private contentWorlds = new Map<string, number>();
-    /** electronId → popup 世界 contextId（跑扩展 popup/options 页 JS，避免与 CS 顶层声明冲突） */
-    private popupWorlds = new Map<string, number>();
+    /** popup 世界 contextId → electronId（每次打开新建，历史世界留存于映射中） */
+    private popupCtxs = new Map<number, string>();
     /** 当前文档已执行过 CS 入口的扩展（导航后清空） */
     private ran = new Set<string>();
     private attached = false;
@@ -254,7 +271,7 @@ class CsPageSession {
             // 主框架导航：世界与执行标记全部作废，sync 时按新文档重建
             this.frameId = String(params.frame.id || this.frameId);
             this.contentWorlds.clear();
-            this.popupWorlds.clear();
+            this.popupCtxs.clear();
             this.ran.clear();
             this.ctxToExt.clear();
             return;
@@ -364,13 +381,16 @@ class CsPageSession {
         }
         let electronId = this.ctxToExt.get(ctxId);
         if (!electronId) {
-            for (const [eid, cid] of [...this.contentWorlds, ...this.popupWorlds]) {
-                if (cid === ctxId) {
-                    electronId = eid;
-                    this.ctxToExt.set(ctxId, eid);
-                    break;
+            electronId = this.popupCtxs.get(ctxId) || null;
+            if (!electronId) {
+                for (const [eid, cid] of this.contentWorlds) {
+                    if (cid === ctxId) {
+                        electronId = eid;
+                        break;
+                    }
                 }
             }
+            if (electronId) this.ctxToExt.set(ctxId, electronId);
         }
         const ext = this.host.listNativeExts().find((e) => e.electronId === electronId);
         const result = ext
@@ -552,20 +572,18 @@ class CsPageSession {
         }
     }
 
-    /** 确保扩展的 popup 世界存在（独立于 content 世界，避免顶层声明冲突），返回 contextId */
+    /** 确保扩展的 popup 世界（★ 每次打开面板都新建 —— 世界跨打开持久会让旧垫片/旧声明残留），返回 contextId */
     async ensurePopupWorld(ext: ICsExtInfo): Promise<number> {
-        let ctxId = this.popupWorlds.get(ext.electronId);
-        if (ctxId) return ctxId;
         if (!this.alive || !this.frameId) throw new Error("CDP 会话未就绪");
         const r: any = await this.send("Page.createIsolatedWorld", {
             frameId: this.frameId,
-            worldName: POPUP_WORLD_PREFIX + ext.electronId,
+            worldName: POPUP_WORLD_PREFIX + ext.electronId + "-" + Date.now().toString(36),
             grantUniversalAccess: true,
             allowCommandLineAPI: false,
         });
-        ctxId = r?.executionContextId;
+        const ctxId = r?.executionContextId;
         if (!ctxId) throw new Error("createIsolatedWorld 未返回 contextId");
-        this.popupWorlds.set(ext.electronId, ctxId);
+        this.popupCtxs.set(ctxId, ext.electronId);
         await this.send("Runtime.addBinding", { name: BRIDGE_NAME, executionContextId: ctxId });
         const shim = buildShim(ext, this.host.messages(ext.path, ext.defaultLocale));
         const sr: any = await this.send("Runtime.evaluate", { expression: shim, contextId: ctxId, returnByValue: false });
@@ -651,7 +669,11 @@ function buildShim(ext: ICsExtInfo, messages: Record<string, any>): string {
         return p;
     }
     window.chrome = window.chrome || {};
-    var chrome_ = window.chrome;
+    // ★ 整体替换 chrome 对象：世界里的 chrome 可能是 Electron 原生绑定
+    //   （storage.local 真实可用、但访问 storage.sync 会原生抛
+    //   "sync" is not available in this instance of Chrome），逐属性赋值
+    //   对原生访问器会被静默忽略。整体替换后所有命名空间都是我们的实现。
+    var chrome_ = {};
     chrome_.runtime = {
         id: EXT.id,
         getManifest: function () { return { manifest_version: 3, name: EXT.name, version: EXT.version }; },
@@ -712,6 +734,8 @@ function buildShim(ext: ICsExtInfo, messages: Record<string, any>): string {
         };
     }
     if (!chrome_.dom) chrome_.dom = {};
+    // 整体替换挂载（见上方注释：原生访问器属性会被静默忽略，必须整对象替换）
+    window.chrome = chrome_;
 })();
 `;
 }
