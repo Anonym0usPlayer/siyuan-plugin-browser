@@ -311,6 +311,71 @@ class CsPageSession {
         ]);
     }
 
+    /** Node http(s) 代发内核请求（面板/内容世界的 mixed content 绕行）。
+     *  用户配置的 ip scheme 可能与内核真实协议不符（如 http:// 配到 https 内核）——
+     *  失败后自动交换协议重试一次。 */
+    private async kernelFetchNode(
+        url: string,
+        method: string,
+        headers: Record<string, string>,
+        body?: string
+    ): Promise<{ status: number; bodyText: string }> {
+        let u: URL;
+        try {
+            u = new URL(url);
+        } catch {
+            return { status: 0, bodyText: "" };
+        }
+        const attempt = (scheme: string): Promise<{ status: number; bodyText: string }> =>
+            new Promise((resolve) => {
+                const req = (window as any).require;
+                if (!req) { resolve({ status: 0, bodyText: "" }); return; }
+                const lib = scheme === "https" ? req("https") : req("http");
+                let settled = false;
+                const done = (v: { status: number; bodyText: string }) => {
+                    if (settled) return;
+                    settled = true;
+                    resolve(v);
+                };
+                try {
+                    const rq = lib.request(
+                        {
+                            hostname: u.hostname,
+                            port: u.port || (scheme === "https" ? 443 : 80),
+                            path: u.pathname + u.search,
+                            method,
+                            headers,
+                            // 思源内核是自签名证书 —— Node 默认拒绝，必须放宽
+                            rejectUnauthorized: false,
+                        },
+                        (res: any) => {
+                            let data = "";
+                            res.on("data", (c: any) => { data += c; });
+                            res.on("end", () => done({ status: res.statusCode || 0, bodyText: data }));
+                            res.on("error", () => done({ status: 0, bodyText: "" }));
+                        }
+                    );
+                    rq.setTimeout(30000, () => {
+                        try { rq.destroy(); } catch (e) {}
+                        done({ status: 0, bodyText: "" });
+                    });
+                    rq.on("error", () => done({ status: 0, bodyText: "" }));
+                    if (body !== undefined) rq.write(body);
+                    rq.end();
+                } catch (e) {
+                    done({ status: 0, bodyText: "" });
+                }
+            });
+        const scheme0 = u.protocol.replace(":", "") || "http";
+        const first = await attempt(scheme0);
+        if (first.status === 0) {
+            // 协议可能配反（http:// 配到 https 内核）→ 交换协议重试一次
+            const alt = scheme0 === "http" ? "https" : "http";
+            return await attempt(alt);
+        }
+        return first;
+    }
+
     async start(): Promise<void> {
         try {
             this.wc.debugger.attach("1.3");
@@ -344,9 +409,57 @@ class CsPageSession {
             this.ctxToExt.clear();
             return;
         }
+        if (method === "Runtime.executionContextCreated") {
+            // Electron 原生注入的扩展 CS 世界（空壳 chrome 死代码）静默化：
+            // 其周期性 chrome.runtime.sendMessage 调用会持续刷
+            // "Unchecked runtime.lastError: Could not establish connection"（用户可见噪音）
+            const c = params?.context || {};
+            const isIsolated = c.type === "isolated" || (c.auxData && c.auxData.type === "isolated");
+            const cname = String(c.name || "");
+            if (isIsolated
+                && String(c.origin || "").indexOf("chrome-extension://") === 0
+                && cname.indexOf(CS_WORLD_PREFIX) !== 0
+                && cname.indexOf(POPUP_WORLD_PREFIX) !== 0) {
+                void this.silenceNativeWorld(Number(c.id));
+            }
+            return;
+        }
         if (method === "Runtime.bindingCalled" && params?.name === BRIDGE_NAME) {
             void this.onBridgeCall(Number(params.executionContextId), String(params.payload || "{}"));
         }
+    }
+
+    private silencedCtxs = new Set<number>();
+
+    /** 原生世界静默桩：chrome.runtime.sendMessage/tabs.sendMessage 变 no-op，
+     *  消除死代码副本的 lastError 刷屏。功能由自建世界（__syCsRt_）承担。 */
+    private async silenceNativeWorld(ctxId: number): Promise<void> {
+        if (this.silencedCtxs.has(ctxId) || this.silencedCtxs.size > 200) return;
+        this.silencedCtxs.add(ctxId);
+        try {
+            await this.send(
+                "Runtime.evaluate",
+                {
+                    expression: `(function () {
+                        try {
+                            if (window.__sySilenced) return;
+                            window.__sySilenced = true;
+                            if (typeof chrome === "undefined" || !chrome.runtime) return;
+                            var eventHub = function () {
+                                return { addListener: function () {}, removeListener: function () {}, hasListener: function () { return false; } };
+                            };
+                            var noSend = function () { return Promise.resolve(undefined); };
+                            try { Object.defineProperty(chrome.runtime, "sendMessage", { configurable: true, get: function () { return noSend; } }); } catch (e) {}
+                            try { if (chrome.tabs) { Object.defineProperty(chrome.tabs, "sendMessage", { configurable: true, get: function () { return noSend; } }); } } catch (e) {}
+                            try { chrome.runtime.onMessage = eventHub(); } catch (e) {}
+                        } catch (e) {}
+                    })()`,
+                    contextId: ctxId,
+                    returnByValue: false,
+                },
+                5000
+            );
+        } catch {}
     }
 
     /** 确保当前文档里所有适用扩展都有可用世界并已执行 CS */
@@ -503,6 +616,15 @@ class CsPageSession {
                 }
             }
             return { data: undefined };
+        }
+        if (req.type === "kernelfetch") {
+            // 面板/内容世界的内核请求代理（mixed content 绕行）：Node http 代发
+            const url = String(args.url || "");
+            const method = String(args.method || "GET").toUpperCase();
+            const headers = (args.headers && typeof args.headers === "object") ? args.headers : {};
+            const body = args.body === undefined || args.body === null ? undefined : String(args.body);
+            const r = await this.kernelFetchNode(url, method, headers, body);
+            return { data: r };
         }
         if (req.type === "sendmessage") {
             return await this.routeSendMessage(ext, args);
@@ -1105,6 +1227,39 @@ function buildShim(ext: ICsExtInfo, messages: Record<string, any>): string {
         }
         return p;
     }
+    // 内核请求代理：https 页面的隔离世界 fetch http://127.0.0.1/<localhost> 是
+    // mixed content，直接 "Failed to fetch"（实测 Clip 发送/笔记本列表全挂）。
+    // 内核 URL 转经宿主桥，宿主用 Node http 代发（绕开浏览器 fetch 限制）。
+    try {
+        var oFetch = window.fetch;
+        window.fetch = function (input, init) {
+            try {
+                var url = typeof input === "string" ? input : (input && input.url) || "";
+                if (/^http:\\/\\/(127\\.0\\.0\\.1|localhost)(:\\d+)?/i.test(url)) {
+                    var headers = {};
+                    if (init && init.headers) {
+                        if (typeof init.headers.forEach === "function") {
+                            init.headers.forEach(function (v, k) { headers[k] = v; });
+                        } else {
+                            for (var k in init.headers) { headers[k] = init.headers[k]; }
+                        }
+                    }
+                    return hostCall("kernelfetch", {
+                        url: url,
+                        method: (init && init.method) || "GET",
+                        headers: headers,
+                        body: (init && init.body) === undefined || (init && init.body) === null ? null : String(init.body),
+                    }).then(function (r) {
+                        var resp = (typeof r === "string") ? JSON.parse(r) : (r || {});
+                        var st = resp.status || 0;
+                        if (st < 200) throw new TypeError("Failed to fetch");
+                        return new Response(resp.bodyText || "", { status: st });
+                    });
+                }
+            } catch (e) {}
+            return oFetch.apply(window, arguments);
+        };
+    } catch (e) {}
     // API 调用轨迹（调试扩展初始化卡点；self.__syApiLog 由宿主或探针读取）
     var __traceDepth = 0;
     function traced(name, fn) {
