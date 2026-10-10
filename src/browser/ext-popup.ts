@@ -94,6 +94,20 @@ export const POPUP_JS_PRELUDE = `
 (function () {
     if (window.__syExtPopupBodyHook) return;
     window.__syExtPopupBodyHook = true;
+    // currentScript 伪造：webpack/rspack runtime 的 publicPath 自动检测依赖
+    // document.currentScript.src；Runtime.evaluate 环境里它是 null，runtime
+    // 会直接 throw "Automatic publicPath is not supported" —— 提供伪元素
+    // （src = chrome-extension://<id>/<当前文件>），publicPath 语义与真实扩展一致
+    self.__sySetCurrentScript = function (url) {
+        try {
+            var fake = document.createElement("script");
+            fake.src = url;
+            Object.defineProperty(document, "currentScript", {
+                configurable: true,
+                get: function () { return fake; },
+            });
+        } catch (e) {}
+    };
     function wrap() {
         var h = document.getElementById("sy-ext-popup-host");
         // 注意：__syWrap 是主世界设置的 expando，跨世界不可见；
@@ -235,7 +249,7 @@ export async function showExtensionPopupInPage(opts: {
     electronId: string;
     popupPath: string;
     anchorRect?: { right: number; bottom: number };
-    evalJs?: (src: string) => Promise<any>;
+    evalJs?: (src: string, relPath: string) => Promise<any>;
 }): Promise<{ ok: boolean; error?: string }> {
     const { webview, extPath, electronId, popupPath, anchorRect } = opts;
     try {
@@ -253,7 +267,8 @@ export async function showExtensionPopupInPage(opts: {
         };
 
         const cssLinks = collectCssHrefs(html);
-        const scriptSrcs = collectScriptSrcs(html).map(resolveRel);
+        const jsRels = collectScriptSrcs(html);
+        const scriptSrcs = jsRels.map(resolveRel);
 
         // css 内容内联（样式里的相对 url() 也需要重写，简化处理：只处理 chrome-extension 绝对化）。
         // light DOM 下为免 popup.css 的 body/* 全局规则污染宿主页面，做作用域重写。
@@ -355,12 +370,13 @@ export async function showExtensionPopupInPage(opts: {
             // 按(html 顺序)逐文件执行 —— 每文件等价于真实浏览器的独立 script 标签
             // （webpack chunk push → runtime 初始化消化的模式依赖这个语义）。
             // 重声明问题已由「每次打开新建 popup 世界」根治，无需打包。
-            await opts.evalJs(POPUP_JS_PRELUDE);
-            for (const src of jsSources) {
+            // 每个文件执行前伪造 document.currentScript（webpack/rspack publicPath 检测依赖它）
+            await opts.evalJs(POPUP_JS_PRELUDE, "__prelude__");
+            for (let i = 0; i < jsSources.length; i++) {
                 try {
-                    await opts.evalJs(src);
+                    await opts.evalJs(jsSources[i], jsRels[i]);
                 } catch (e: any) {
-                    const err = "popup 脚本执行失败: " + String(e?.message || e).slice(0, 200);
+                    const err = "popup 脚本执行失败[" + i + "](" + jsRels[i] + "): " + String(e?.message || e).slice(0, 200);
                     dbg2({ ok: false, error: err });
                     return { ok: false, error: err };
                 }

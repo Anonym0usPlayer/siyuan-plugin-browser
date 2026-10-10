@@ -451,8 +451,9 @@ export class BrowserTab {
         const r = anchor
             ? anchor.getBoundingClientRect()
             : ({ right: (window.innerWidth || 1200) - 24, bottom: 48 } as DOMRect);
-        // popup JS 在扩展专属世界执行（chrome.* 经桥真实可用；主世界是空壳），
-        // 前奏把 document.getElementById/querySelector 重绑定到面板的 shadow root
+        // popup JS 在扩展专属世界执行（chrome.* 经桥真实可用；主世界是空壳）。
+        // 每个文件执行前伪造 document.currentScript —— webpack/rspack runtime 的
+        // publicPath 自动检测依赖它（缺失会 throw "Automatic publicPath is not supported"）
         const extInfo = {
             electronId: ext.electronId,
             path: ext.path,
@@ -467,11 +468,15 @@ export class BrowserTab {
             electronId: ext.electronId,
             popupPath: ext.popupPath,
             anchorRect: { right: r.right, bottom: r.bottom },
-            evalJs: (src) =>
-                evalPopupJs(this.webview, extInfo, POPUP_JS_PRELUDE + "\n" + src).then((rr) => {
+            evalJs: (src, relPath) => {
+                const fakeUrl = "chrome-extension://" + ext.electronId + "/" + String(relPath).replace(/^\.\//, "");
+                const prefixed =
+                    "self.__sySetCurrentScript && self.__sySetCurrentScript(" + JSON.stringify(fakeUrl) + ");\n" + src;
+                return evalPopupJs(this.webview, extInfo, prefixed).then((rr) => {
                     if (!rr.ok) throw new Error(rr.error);
                     return rr.value;
-                }),
+                });
+            },
         });
         if (!out.ok) {
             showMessage(`打开「${ext.name}」面板失败: ${out.error}`, 5000, "error");

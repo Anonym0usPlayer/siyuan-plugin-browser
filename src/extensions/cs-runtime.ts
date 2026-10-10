@@ -552,9 +552,35 @@ class CsPageSession {
         }
     }
 
-    /** 在指定执行上下文里 evaluate（供 popup 世界等复用） */
+    /** 在指定执行上下文里 evaluate（供 popup 世界等复用）。
+     *  超大表达式分块传输：实测 1.8MB 的 expression 经 debugger 通道会静默无效
+     *  （返回 ok 但脚本未执行），分块 push 后 eval 组装可绕过。 */
     async evaluateInWorld(ctxId: number, expr: string, timeoutMs = 30000): Promise<{ ok: boolean; value?: any; error?: string }> {
         try {
+            if (expr.length > 150_000) {
+                await this.send("Runtime.evaluate", { expression: "self.__syBigSrc = []", contextId: ctxId }, timeoutMs);
+                const CHUNK = 100_000;
+                for (let i = 0; i < expr.length; i += CHUNK) {
+                    const piece = expr.slice(i, i + CHUNK);
+                    await this.send(
+                        "Runtime.evaluate",
+                        { expression: "self.__syBigSrc.push(" + JSON.stringify(piece) + ")", contextId: ctxId },
+                        timeoutMs
+                    );
+                }
+                const r: any = await this.send(
+                    "Runtime.evaluate",
+                    { expression: "(0, eval)(self.__syBigSrc.join(''))", contextId: ctxId, returnByValue: false, awaitPromise: false },
+                    timeoutMs
+                );
+                if (r?.exceptionDetails) {
+                    return {
+                        ok: false,
+                        error: String(r.exceptionDetails?.exception?.description || r.exceptionDetails?.text || "执行异常").slice(0, 300),
+                    };
+                }
+                return { ok: true };
+            }
             const r: any = await this.send(
                 "Runtime.evaluate",
                 { expression: expr, contextId: ctxId, returnByValue: true, awaitPromise: true },
@@ -668,6 +694,25 @@ function buildShim(ext: ICsExtInfo, messages: Record<string, any>): string {
         }
         return p;
     }
+    // API 调用轨迹（调试扩展初始化卡点；self.__syApiLog 由宿主或探针读取）
+    var __traceDepth = 0;
+    function traced(name, fn) {
+        return function () {
+            var args = arguments;
+            try { (self.__syApiLog = self.__syApiLog || []).push(new Array(__traceDepth + 1).join("  ") + name + "()"); } catch (e) {}
+            __traceDepth++;
+            var done = function (v) { __traceDepth--; return v; };
+            var r = fn.apply(null, args);
+            if (r && typeof r.then === "function") {
+                return r.then(
+                    function (v) { return done(v); },
+                    function (e) { try { (self.__syApiLog = self.__syApiLog || []).push(new Array(__traceDepth + 1).join("  ") + name + " REJECT: " + String(e && e.message || e).slice(0, 120)); } catch (e2) {} __traceDepth--; throw e; }
+                );
+            }
+            __traceDepth--;
+            return r;
+        };
+    }
     window.chrome = window.chrome || {};
     // ★ 整体替换 chrome 对象：世界里的 chrome 可能是 Electron 原生绑定
     //   （storage.local 真实可用、但访问 storage.sync 会原生抛
@@ -697,10 +742,10 @@ function buildShim(ext: ICsExtInfo, messages: Record<string, any>): string {
     };
     function storageArea(area) {
         return {
-            get: function (keys, cb) { return cbStyle(hostCall("storage", { op: "get", area: area, payload: keys === undefined ? null : keys }), cb); },
-            set: function (items, cb) { return cbStyle(hostCall("storage", { op: "set", area: area, payload: items === undefined ? {} : items }), cb); },
-            remove: function (keys, cb) { return cbStyle(hostCall("storage", { op: "remove", area: area, payload: keys === undefined ? [] : keys }), cb); },
-            clear: function (cb) { return cbStyle(hostCall("storage", { op: "clear", area: area, payload: null }), cb); },
+            get: traced(area + ".get", function (keys, cb) { return cbStyle(hostCall("storage", { op: "get", area: area, payload: keys === undefined ? null : keys }), cb); }),
+            set: traced(area + ".set", function (items, cb) { return cbStyle(hostCall("storage", { op: "set", area: area, payload: items === undefined ? {} : items }), cb); }),
+            remove: traced(area + ".remove", function (keys, cb) { return cbStyle(hostCall("storage", { op: "remove", area: area, payload: keys === undefined ? [] : keys }), cb); }),
+            clear: traced(area + ".clear", function (cb) { return cbStyle(hostCall("storage", { op: "clear", area: area, payload: null }), cb); }),
             onChanged: { addListener: function () {}, removeListener: function () {}, hasListener: function () { return false; } },
         };
     }
@@ -734,8 +779,40 @@ function buildShim(ext: ICsExtInfo, messages: Record<string, any>): string {
         };
     }
     if (!chrome_.dom) chrome_.dom = {};
-    // 整体替换挂载（见上方注释：原生访问器属性会被静默忽略，必须整对象替换）
-    window.chrome = chrome_;
+    // 整体替换挂载（见上方注释：原生访问器属性会被静默忽略，必须整对象替换）。
+    // 外层 Proxy：访问未实现的命名空间时一次性告警并返回通用桩
+    // （方法返回 Promise<undefined>、可继续嵌套访问）—— 让重度扩展
+    // （如 AdGuard 引用 declarativeNetRequest）不至于在启动期崩掉。
+    window.chrome = new Proxy(chrome_, {
+        get(target, prop) {
+            if (prop in target) return target[prop];
+            const key = String(prop);
+            if (key === "toJSON" || typeof prop !== "string") return undefined;
+            const miss = (self.__syMissingNs = self.__syMissingNs || {});
+            if (!miss[key]) {
+                miss[key] = true;
+                try { console.warn("[sy-ext-shim] chrome." + key + " 未实现，返回通用桩"); } catch (e) {}
+            }
+            const stubKey = "obj_" + key;
+            if (!miss[stubKey]) {
+                miss[stubKey] = new Proxy(function () {}, {
+                    get(_t, m2) {
+                        const m = String(m2);
+                        if (m === "then") return undefined; // 保持非 thenable
+                        const fk = "fn_" + key + "_" + m;
+                        if (!miss[fk]) {
+                            miss[fk] = function () {
+                                return Promise.resolve(undefined);
+                            };
+                        }
+                        return miss[fk];
+                    },
+                    apply() { return Promise.resolve(undefined); },
+                });
+            }
+            return miss[stubKey];
+        },
+    });
 })();
 `;
 }
