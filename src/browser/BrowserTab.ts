@@ -19,34 +19,6 @@ import { evalPopupJs } from "../extensions/cs-runtime";
 import { POPUP_JS_PRELUDE } from "./ext-popup";
 import type { IExtensionMenuItem } from "./contextMenu";
 
-/** 图标文件 → data URL 缓存（key 为 path+相对路径；读失败/非图片返回 undefined 且不缓存） */
-const iconDataUrlCache = new Map<string, string>();
-
-function iconDataUrl(extPath: string, relPath: string): string | undefined {
-    const key = `${extPath}|${relPath}`;
-    const hit = iconDataUrlCache.get(key);
-    if (hit) return hit;
-    try {
-        const req = (window as any).require;
-        const fs = req("fs");
-        const path = req("path");
-        const abs = path.join(extPath, String(relPath).replace(/^\.\//, ""));
-        if (!fs.existsSync(abs)) return undefined;
-        const buf = fs.readFileSync(abs);
-        const mime = /\.png$/i.test(abs) ? "image/png"
-            : /\.jpe?g$/i.test(abs) ? "image/jpeg"
-            : /\.svg$/i.test(abs) ? "image/svg+xml"
-            : /\.gif$/i.test(abs) ? "image/gif"
-            : /\.ico$/i.test(abs) ? "image/x-icon" : "application/octet-stream";
-        if (mime === "application/octet-stream") return undefined;
-        const url = `data:${mime};base64,${buf.toString("base64")}`;
-        iconDataUrlCache.set(key, url);
-        return url;
-    } catch {
-        return undefined;
-    }
-}
-
 /** 浏览器页签实例依赖 */
 export interface BrowserTabDeps {
     i18n: Record<string, string>;
@@ -168,38 +140,6 @@ export class BrowserTab {
         // 把工具栏插到 webview 之前
         this.element.insertBefore(this.toolbar.element, this.webview.parentElement);
 
-        // 扩展图标区：列出有 popup 的已启用扩展，点击后在当前页内弹出面板
-        this.toolbar.setExtensionCallbacks({
-            list: () => {
-                const host = (window as any).browserPlugin?.extensionHost;
-                if (!host?.listActionable) return [];
-                return host.listActionable().map((e: any) => ({
-                    id: e.id,
-                    name: e.name,
-                    // 图标不能用 chrome-extension:// URL：icons 一般不在扩展的
-                    // web_accessible_resources 里，宿主页加载会被拒（实测两装扩展均如此）。
-                    // 扩展目录就在本机磁盘上，直接读文件转 data URL 最可靠。
-                    iconUrl: e.iconPath && e.path ? iconDataUrl(e.path, e.iconPath) : undefined,
-                    title: e.actionTitle || e.name,
-                    _raw: e,
-                }));
-            },
-            onClick: (extId, anchor) => {
-                if (extId === "__manager__") {
-                    // 常驻入口：打开扩展管理对话框（复用设置页里的同一入口）
-                    const plugin = (window as any).browserPlugin as any;
-                    plugin?.extensionHost?.openManager(this.deps.i18n);
-                    return;
-                }
-                void this.openExtensionPopup(extId, anchor);
-            },
-        });
-        // 数据晚于构造就绪的场景（恢复标签）：load 完成后重画图标区
-        try {
-            window.addEventListener("sy-browser-ext-host-loaded", () => {
-                this.toolbar.renderExtensionBar();
-            });
-        } catch {}
         // 扩展 contextMenus 项预热（SiYuan Clip 等）：SW 查询慢且可能唤醒，
         // 后台预热进缓存，右键弹出时同步取用；5 分钟过期后台再刷
         this.controller.setExtensionMenuSource(
