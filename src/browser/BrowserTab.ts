@@ -176,7 +176,6 @@ export class BrowserTab {
                 })();
             },
         );
-        this.preheatExtMenuItems();
 
         // 监听设置变化
         deps.settings.onChange(() => {
