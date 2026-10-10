@@ -28,7 +28,7 @@
  * 与 disposeCsRuntime 清理。
  */
 import type { IWebviewTag } from "../types";
-import { CS_WORLD_PREFIX, cdpEvalOnce, findSwTarget } from "./sw-bridge";
+import { CS_WORLD_PREFIX, cdpEvalOnce, cdpHttpLikelyDead, evalInSwFlat, findSwTarget, SW_FLAT_UNAVAILABLE } from "./sw-bridge";
 
 const BRIDGE_NAME = "__syExtHost";
 /** popup/options 页专属世界前缀（独立于 content 世界，避免顶层声明冲突） */
@@ -246,6 +246,17 @@ class CsRuntimeManager {
             dbg({ ok: false, error: err });
             return { ok: false, error: err };
         }
+    }
+
+    /** manager 级 SW eval：任一存活会话（HTTP→flat 双通道）→ 主窗口兜底 */
+    async evalInSwAny(electronId: string, expr: string): Promise<{ value?: any; err?: string }> {
+        for (const s of this.sessions.values()) {
+            if (!s.alive) continue;
+            const r = await s.evalInSw({ electronId } as ICsExtInfo, expr);
+            if (r.err !== SW_FLAT_UNAVAILABLE || r.value !== undefined) return r;
+            // 该会话两条通道都不可用 → 换下一个
+        }
+        return await evalInSwViaMainWindow(electronId, expr);
     }
 }
 
@@ -550,7 +561,17 @@ class CsPageSession {
         const r = await this.evalInSw(ext, expr);
         if (r.err) return { err: r.err };
         try {
-            const parsed = JSON.parse(String(r.value));
+            let parsed = JSON.parse(String(r.value));
+            // SW 刚被 loadExtension 唤醒时 app 尚在初始化（AdGuard 过滤器加载 5-10s），
+            // handler 注册滞后 → __noHandlers 重试几轮，覆盖首开窗口期
+            let tries = 0;
+            while (parsed && parsed.__noHandlers && tries < 3) {
+                tries++;
+                await new Promise((res) => setTimeout(res, 1500));
+                const r2 = await this.evalInSw(ext, expr);
+                if (r2.err) return { err: r2.err };
+                parsed = JSON.parse(String(r2.value));
+            }
             if (parsed && parsed.__noHandlers) return { err: "扩展 SW 无 onMessage 处理器（垫片未运行？）" };
             return { data: parsed === null ? undefined : parsed };
         } catch {
@@ -631,7 +652,16 @@ class CsPageSession {
         const r = await this.evalInSw(ext, expr);
         if (r.err) return { err: r.err };
         try {
-            const parsed = JSON.parse(String(r.value));
+            let parsed = JSON.parse(String(r.value));
+            // SW 唤醒后 app 初始化窗口期：onConnect handler 可能尚未注册 → 重试几轮
+            let tries = 0;
+            while (parsed && (parsed.__noConnectHandlers || parsed.__noPortListeners) && tries < 4) {
+                tries++;
+                await new Promise((res) => setTimeout(res, 1500));
+                const r2 = await this.evalInSw(ext, expr);
+                if (r2.err) return { err: r2.err };
+                parsed = JSON.parse(String(r2.value));
+            }
             if (parsed && parsed.__noConnectHandlers) return { err: "扩展 SW 无 onConnect 处理器（垫片 v5 未生效？）" };
             if (parsed && parsed.__noPortListeners) return { err: "扩展 SW onConnect 处理器未注册 port.onMessage 监听" };
             if (parsed && parsed.__portErr) return { err: "port 路由异常: " + parsed.__portErr };
@@ -666,10 +696,22 @@ class CsPageSession {
                 var ufns = self.__syTabUpdatedFns || [];
                 for (var j = 0; j < ufns.length; j++) { try { ufns[j](tab.id, { status: "complete", url: tab.url, title: tab.title }, tab); } catch (e) {} }
             } catch (e) {}
-            return "ok";
+            return JSON.stringify({ c: (self.__syTabCreatedFns || []).length });
         })()`;
         const r = await this.evalInSw(ext, expr);
         if (r.err) return { err: r.err };
+        // onCreated 监听数为 0 = 扩展 app 尚未初始化（TabsApi.start 未跑）→ 喂了白喂，重试
+        try {
+            let parsed = JSON.parse(String(r.value));
+            let tries = 0;
+            while (parsed && parsed.c === 0 && tries < 4) {
+                tries++;
+                await new Promise((res) => setTimeout(res, 1500));
+                const r2 = await this.evalInSw(ext, expr);
+                if (r2.err) return { err: r2.err };
+                parsed = JSON.parse(String(r2.value));
+            }
+        } catch {}
         return { data: "ok" };
     }
 
@@ -831,11 +873,14 @@ class CsPageSession {
         return ctxId;
     }
 
-    private async evalInSw(ext: ICsExtInfo, expr: string): Promise<{ value?: any; err?: string }> {
+    async evalInSw(ext: ICsExtInfo, expr: string): Promise<{ value?: any; err?: string }> {
         let eid = ext.electronId;
-        let target = await findSwTarget(eid);
-        if (!target) {
-            // 唤醒后 id 可能更新（Electron 的 SW origin id 机制），用回传 id 重试
+        // HTTP CDP 熔断生效时直接走进程内 flat 通道（正常启动无 --remote-debugging-port）。
+        // ★ 唤醒只允许发生在对应通道内部：flat 路径绝不能先 wakeOne —— 会把已预热的
+        //    SW remove+load 重启，扩展 app 重新初始化，popup 首开必撞空 handler。
+        let target = cdpHttpLikelyDead() ? null : await findSwTarget(eid);
+        if (!target && !cdpHttpLikelyDead()) {
+            // HTTP 通道存在但 SW 休眠 → 唤醒后重试（dev 场景）
             const fresh = await this.host
                 .wakeOne(eid)
                 .then((r) => (typeof r === "string" ? r : eid))
@@ -845,12 +890,66 @@ class CsPageSession {
                 await new Promise((r) => setTimeout(r, 300));
                 target = await findSwTarget(eid);
             }
-            if (!target) return { err: "扩展 SW 未运行且唤醒失败（CDP 不可用？）" };
+        }
+        if (!target) {
+            // flat 通道（正常启动）：SW 活着就直接 evaluate；不活着由 flat 内部 wake
+            const flat = await evalInSwFlat(
+                (method, params, sessionId) => Promise.race([
+                    this.wc.debugger.sendCommand(method, params, sessionId),
+                    new Promise((_, reject) => setTimeout(() => reject(new Error(`CDP ${method} 超时`)), 12000)),
+                ]),
+                eid,
+                expr,
+                async () => { await this.host.wakeOne(eid); }
+            );
+            if (flat.err !== SW_FLAT_UNAVAILABLE) return flat;
+            const alt = await evalInSwViaMainWindow(eid, expr);
+            if (alt.err !== SW_FLAT_UNAVAILABLE) return alt;
+            return { err: "扩展 SW 未运行且唤醒失败（CDP 不可用？）" };
         }
         const r = await cdpEvalOnce(target.webSocketDebuggerUrl, expr, 12000);
         if (r && typeof r === "object" && r.err) return { err: String(r.err) };
         return { value: r };
     }
+}
+
+/** 主窗口 debugger 兜底（webview 会话不可用时；attach 与 DevTools 互斥，用完即 detach） */
+async function evalInSwViaMainWindow(electronId: string, expr: string): Promise<{ value?: any; err?: string }> {
+    let attachedHere = false;
+    try {
+        const req = (window as any).require;
+        if (!req) return { err: SW_FLAT_UNAVAILABLE };
+        const remote = req("@electron/remote");
+        const wc = remote.getCurrentWebContents();
+        const dbg = wc.debugger;
+        if (!dbg.isAttached()) {
+            dbg.attach("1.3");
+            attachedHere = true;
+        }
+        const sender = (method: string, params?: any, sessionId?: string) =>
+            Promise.race([
+                dbg.sendCommand(method, params, sessionId),
+                new Promise((_, reject) => setTimeout(() => reject(new Error(`CDP ${method} 超时`)), 12000)),
+            ]);
+        return await evalInSwFlat(sender, electronId, expr);
+    } catch (e: any) {
+        // attach 失败（如用户开着 DevTools）按通道不可用处理
+        void e;
+        return { err: SW_FLAT_UNAVAILABLE };
+    } finally {
+        if (attachedHere) {
+            try {
+                (window as any).require("@electron/remote").getCurrentWebContents().debugger.detach();
+            } catch {}
+        }
+    }
+}
+
+/** manager 级 SW eval（供 contextMenus 等无 webview 上下文的调用方使用）：
+ *  任一存活 webview 会话的 evalInSw（HTTP→flat 双通道），没有则主窗口兜底 */
+export function evalInSwBridge(ext: { electronId: string }, expr: string): Promise<{ value?: any; err?: string }> {
+    if (!manager) return Promise.resolve({ err: "cs-runtime 未初始化" });
+    return manager.evalInSwAny(ext.electronId, expr);
 }
 
 function safeUrl(webview: IWebviewTag): string {

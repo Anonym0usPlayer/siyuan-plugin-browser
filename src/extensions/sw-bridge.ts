@@ -14,8 +14,10 @@
  *
  * 通道为什么是 CDP：宿主与 SW 之间没有任何常规消息通道（页面 world 的
  * chrome.storage 不存在、runtime.sendMessage 需要 externally_connectable、
- * storage 隔离按扩展划分）。CDP 端口只在 --remote-debugging-port 开启时
- * 可用 —— 当前是开发者场景；普通用户需要后续换 storage 桥或原生实现。
+ * storage 隔离按扩展划分）。两条传输：
+ * 1) HTTP /json/list + WebSocket —— 仅 --remote-debugging-port 开启时可用（开发者场景）；
+ * 2) 进程内 webContents.debugger + Target 域 flat session（evalInSwFlat）——
+ *    正常启动也可用，任何调用方在 HTTP 通道失败时都应回退到它。
  *
  * CDP HTTP 端点（/json/list）不带 CORS 头，页面 fetch 读不了响应，
  * 所以用 Node http（nodeIntegration 渲染进程可 require）拿列表；
@@ -254,7 +256,14 @@ export function fetchTargets(): Promise<Array<Record<string, any>>> {
                     try { resolve(JSON.parse(data)); } catch (e) { reject(new Error("CDP 响应解析失败")); }
                 });
             });
-            req.on("error", (e) => reject(new Error(`CDP 不可达（需 --remote-debugging-port 启动思源）: ${e.message}`)));
+            req.on("error", (e: any) => {
+                // 连接被拒 = 没开 --remote-debugging-port：熔断 5 分钟，
+                // 期间调用方直接走进程内 flat 通道（每次撞 10×300ms 重试会拖垮 popup）
+                if (e && (e.code === "ECONNREFUSED" || e.code === "ECONNRESET")) {
+                    cdpHttpDeadUntil = Date.now() + 5 * 60_000;
+                }
+                reject(new Error(`CDP 不可达（需 --remote-debugging-port 启动思源）: ${e.message}`));
+            });
             req.on("timeout", () => { req.destroy(); reject(new Error("CDP 请求超时")); });
         } catch (e: any) {
             reject(new Error(String(e?.message || e)));
@@ -262,9 +271,117 @@ export function fetchTargets(): Promise<Array<Record<string, any>>> {
     });
 }
 
+/** HTTP CDP 端点熔断（ECONNREFUSED 后置位 5 分钟） */
+let cdpHttpDeadUntil = 0;
+export function cdpHttpLikelyDead(): boolean {
+    return Date.now() < cdpHttpDeadUntil;
+}
+
 /** SW target 的 origin id 可能与扩展 id 不是同一套（Electron 生成机制未文档化，实测两者会不一致）——
  *  URL 快速匹配失败时逐个 SW evaluate chrome.runtime.id 确认，结果按 targetId 缓存 */
 const swRuntimeIdCache = new Map<string, string>(); // targetId → runtimeId
+
+// ===== 进程内 SW 直驱（webContents.debugger + Target 域，正常启动无需 --remote-debugging-port） =====
+//
+// 2026-10 实测（Electron 44 / Chromium 152）：页面级 debugger 会话发 Target.getTargets
+// 能拿到**整个浏览器进程**的 target 树（含扩展 service_worker）；
+// Target.attachToTarget {flatten:true} 拿 sessionId 后，sendCommand(method, params, sessionId)
+// 即可在 SW 里求值（Electron debugger API 原生支持第三参 sessionId）。
+// 这是无调试端口场景下宿主↔SW 的唯一通道 —— HTTP /json/list 只在 --remote-debugging-port 下存在。
+
+/** sw-bridge 的 CDP_HTTP 端点不可用（正常启动无调试端口）时的回退标记 */
+export const SW_FLAT_UNAVAILABLE = "__sySwFlatUnavailable";
+
+export type FlatCommandSender = (method: string, params?: any, sessionId?: string) => Promise<any>;
+
+/** electronId → {targetId, sessionId}（SW 重启后 targetId 变化，evaluate 失败时清理重找） */
+const swFlatSessionCache = new Map<string, { targetId: string; sessionId: string }>();
+
+/**
+ * 进程内找扩展 SW 的 flat session：Target.getTargets → URL 匹配 → 逐个
+ * attach 探测 chrome.runtime.id。找不到时先 wake 一次再轮询（SW 启动需时间）。
+ */
+export async function findSwFlatSession(
+    sendCommand: FlatCommandSender,
+    electronId: string,
+    wake?: () => Promise<void>,
+): Promise<{ targetId: string; sessionId: string } | null> {
+    const cached = swFlatSessionCache.get(electronId);
+    if (cached) return cached; // 失效由 evalInSwFlat 的重试兜底
+    for (let attempt = 0; attempt < 10; attempt++) {
+        try {
+            const r = await sendCommand("Target.getTargets");
+            const infos: any[] = (r && r.targetInfos) || [];
+            const sws = infos.filter((t) => t.type === "service_worker" || t.type === "background_page");
+            // 1) URL 快速匹配
+            let picked = sws.find((t) => String(t.url).includes(electronId));
+            // 2) 逐个 attach 探测 chrome.runtime.id（顺带缓存其它扩展的会话）
+            for (const t of sws) {
+                if (picked) break;
+                try {
+                    const a = await sendCommand("Target.attachToTarget", { targetId: t.targetId, flatten: true });
+                    const sid = a && a.sessionId;
+                    if (!sid) continue;
+                    const er = await sendCommand("Runtime.evaluate", { expression: "chrome.runtime.id", returnByValue: true }, sid);
+                    const rid = er && er.result && er.result.value;
+                    if (rid) {
+                        swFlatSessionCache.set(String(rid), { targetId: t.targetId, sessionId: sid });
+                        if (String(rid) === electronId) { picked = t; break; }
+                    }
+                } catch {}
+            }
+            if (picked) {
+                const hit = swFlatSessionCache.get(electronId);
+                if (hit && hit.targetId === picked.targetId) return hit;
+                const a = await sendCommand("Target.attachToTarget", { targetId: picked.targetId, flatten: true });
+                const sid = a && a.sessionId;
+                if (sid) {
+                    const entry = { targetId: picked.targetId, sessionId: sid };
+                    swFlatSessionCache.set(electronId, entry);
+                    return entry;
+                }
+            }
+        } catch {}
+        if (attempt === 0 && wake) {
+            try { await wake(); } catch {}
+        }
+        await new Promise((r2) => setTimeout(r2, 300));
+    }
+    return null;
+}
+
+/**
+ * 进程内在扩展 SW 里求值（webview/主窗口 debugger 会话 + Target 域 flat session）。
+ * 返回 {err: SW_FLAT_UNAVAILABLE} 表示此通道不可用（如 Target 域被拒），调用方可回退/报错。
+ */
+export async function evalInSwFlat(
+    sendCommand: FlatCommandSender,
+    electronId: string,
+    expr: string,
+    wake?: () => Promise<void>,
+): Promise<{ value?: any; err?: string }> {
+    let entry = await findSwFlatSession(sendCommand, electronId, wake);
+    if (!entry) return { err: SW_FLAT_UNAVAILABLE };
+    for (let i = 0; i < 2; i++) {
+        try {
+            const r = await sendCommand(
+                "Runtime.evaluate",
+                { expression: expr, returnByValue: true, awaitPromise: true },
+                entry.sessionId
+            );
+            if (r && r.exceptionDetails) {
+                return { err: String(r.exceptionDetails?.exception?.description || r.exceptionDetails?.text || "SW 执行异常").slice(0, 300) };
+            }
+            return { value: r && r.result ? r.result.value : null };
+        } catch (e: any) {
+            // flat session 失效（SW 重启/target 消失）：清缓存重找一次
+            swFlatSessionCache.delete(electronId);
+            entry = await findSwFlatSession(sendCommand, electronId, wake);
+            if (!entry) return { err: SW_FLAT_UNAVAILABLE };
+        }
+    }
+    return { err: SW_FLAT_UNAVAILABLE };
+}
 
 export async function findSwTarget(electronId: string): Promise<ISwTarget | null> {
     try {
@@ -330,6 +447,9 @@ export function cdpEvalOnce(wsUrl: string, expr: string, timeoutMs = 8000): Prom
 export interface IExtMenuBridge {
     /** 需要 remoteSession 做 remove/loadExtension 唤醒 */
     wakeUp: () => Promise<void>;
+    /** 可选：进程内 SW eval（HTTP 通道不可用的正常启动场景也能用）。
+     *  由调用方注入 cs-runtime 的 evalInSwBridge —— 它内部先试 HTTP 再回退 Target 域。 */
+    evalInSw?: (ext: { electronId: string }, expr: string) => Promise<{ value?: any; err?: string }>;
 }
 
 /**
@@ -338,6 +458,20 @@ export interface IExtMenuBridge {
  */
 export async function listExtensionMenuItems(ext: { electronId: string; path: string }, bridge: IExtMenuBridge): Promise<Array<{ id: string; title: string }>> {
     try {
+        // 进程内通道优先（内部已含 HTTP→flat 回退），无 CDP 端口的正常启动也能列出
+        if (bridge.evalInSw) {
+            const r = await bridge.evalInSw(ext, `(() => {
+                try {
+                    const store = self.__syContextMenuStore;
+                    if (!store) return { err: "no-shim" };
+                    const items = Object.values(store.items).map((x) => ({ id: x.id, title: x.title || x.id }));
+                    return { items };
+                } catch (e) { return { err: String(e) }; }
+            })()`);
+            if (r.err && r.err !== SW_FLAT_UNAVAILABLE) return [];
+            if (r.value && Array.isArray((r.value as any).items)) return (r.value as any).items;
+            // flat 通道不可用（err === SW_FLAT_UNAVAILABLE）→ 落到 HTTP 路径再试一次
+        }
         let target = await findSwTarget(ext.electronId);
         if (!target) {
             await bridge.wakeUp();
@@ -373,19 +507,8 @@ export async function triggerExtensionMenuClick(
     bridge: IExtMenuBridge,
 ): Promise<{ ok: boolean; error?: string }> {
     try {
-        let target = await findSwTarget(ext.electronId);
-        if (!target) {
-            await bridge.wakeUp();
-            for (let i = 0; i < 10 && !target; i++) {
-                await new Promise((r) => setTimeout(r, 300));
-                target = await findSwTarget(ext.electronId);
-            }
-        }
-        if (!target) {
-            return { ok: false, error: "扩展 SW 未运行且唤醒失败（CDP 不可用？）" };
-        }
         const payload = JSON.stringify({ menuItemId: opts.menuItemId, srcUrl: opts.srcUrl ?? null, pageUrl: opts.pageUrl });
-        const r = await cdpEvalOnce(target.webSocketDebuggerUrl, `(async () => {
+        const expr = `(async () => {
             try {
                 const p = ${payload};
                 const store = self.__syContextMenuStore;
@@ -400,7 +523,29 @@ export async function triggerExtensionMenuClick(
                 store.click.__emit({ menuItemId: p.menuItemId, srcUrl: p.srcUrl }, { id: tab.id });
                 return { ok: true, tabId: tab.id };
             } catch (e) { return { err: String(e && e.stack || e).slice(0, 300) }; }
-        })()`);
+        })()`;
+        if (bridge.evalInSw) {
+            const r = await bridge.evalInSw(ext, expr);
+            if (r.err === SW_FLAT_UNAVAILABLE) {
+                return { ok: false, error: "扩展 SW 未运行且唤醒失败（进程内与 CDP 通道均不可用）" };
+            }
+            if (r.err) return { ok: false, error: String(r.err) };
+            const v = r.value as any;
+            if (v && v.ok) return { ok: true };
+            return { ok: false, error: v?.err ? String(v.err) : "触发失败" };
+        }
+        let target = await findSwTarget(ext.electronId);
+        if (!target) {
+            await bridge.wakeUp();
+            for (let i = 0; i < 10 && !target; i++) {
+                await new Promise((r) => setTimeout(r, 300));
+                target = await findSwTarget(ext.electronId);
+            }
+        }
+        if (!target) {
+            return { ok: false, error: "扩展 SW 未运行且唤醒失败（CDP 不可用？）" };
+        }
+        const r = await cdpEvalOnce(target.webSocketDebuggerUrl, expr);
         if (r && r.ok) return { ok: true };
         return { ok: false, error: r?.err ? String(r.err) : "触发失败" };
     } catch (e: any) {

@@ -15,7 +15,7 @@ import { BROWSER_PARTITION } from "../constants";
 import { remoteSession } from "../utils/electron";
 import { showExtensionPopupInPage, closeExtensionPopupInPage, injectExtensionPageRuntime } from "./ext-popup";
 import { listExtensionMenuItems, evalInExtensionWorld } from "../extensions/sw-bridge";
-import { beginPopupWorld, evalPopupJs } from "../extensions/cs-runtime";
+import { beginPopupWorld, evalPopupJs, evalInSwBridge } from "../extensions/cs-runtime";
 import { POPUP_JS_PRELUDE } from "./ext-popup";
 import type { IExtensionMenuItem } from "./contextMenu";
 
@@ -240,7 +240,7 @@ export class BrowserTab {
                 try {
                     const items = await listExtensionMenuItems(
                         { electronId: ext.electronId, path: ext.path },
-                        { wakeUp: () => this.wakeExtSw() },
+                        { wakeUp: () => this.wakeExtSw(), evalInSw: evalInSwBridge },
                     );
                     for (const it of items) {
                         all.push({ id: it.id, title: it.title, electronId: ext.electronId, extPath: ext.path });
