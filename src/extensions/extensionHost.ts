@@ -1097,8 +1097,27 @@ export class ExtensionHost {
                     return null;
                 }
             },
+            wakeSw: async (electronId: string) => {
+                await this.wakeSw(electronId);
+            },
         });
         this.csRuntimeInited = true;
+    }
+
+    /** 无副作用唤醒扩展 SW（startWorkerForScope 只启动 SW，不卸载扩展）：
+     *  remove+load 会销毁正在打开的扩展面板 isolated world（binding 失效），
+     *  面板打开前的预热必须走这里。失败（扩展未加载等）静默回退 remove+load。 */
+    async wakeSw(electronId: string): Promise<void> {
+        const ses = remoteSession();
+        if (!ses) return;
+        try {
+            await ses.serviceWorkers.startWorkerForScope(`chrome-extension://${electronId}/`);
+            return;
+        } catch {}
+        const ext = this.extensions.find((e) => e.electronId === electronId);
+        if (!ext) return;
+        try { ses.removeExtension(electronId); } catch {}
+        try { await ses.loadExtension(ext.path, { allowFileAccess: true }); } catch {}
     }
 
     /** dom-ready 时调用：确保该页签的 CDP 会话与各扩展自建世界就绪 */

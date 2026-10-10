@@ -50,6 +50,10 @@ export interface ICsRuntimeHost {
     messages(extPath: string, defaultLocale: string): Record<string, any>;
     /** 唤醒单个扩展 SW（removeExtension + loadExtension），返回回传的（可能更新过的）id */
     wakeOne(electronId: string): Promise<string | null>;
+    /** 无副作用唤醒 SW（startWorkerForScope，不卸载扩展）——正在打开的扩展
+     *  面板世界会随 removeExtension 被销毁（binding 失效 → hostCall 永挂），
+     *  面板/存储路径的唤醒必须用这个 */
+    wakeSw?(electronId: string): Promise<void>;
 }
 
 let manager: CsRuntimeManager | null = null;
@@ -957,19 +961,29 @@ class CsPageSession {
         //    SW remove+load 重启，扩展 app 重新初始化，popup 首开必撞空 handler。
         let target = cdpHttpLikelyDead() ? null : await findSwTarget(eid);
         if (!target && !cdpHttpLikelyDead()) {
-            // HTTP 通道存在但 SW 休眠 → 唤醒后重试（dev 场景）
-            const fresh = await this.host
-                .wakeOne(eid)
-                .then((r) => (typeof r === "string" ? r : eid))
-                .catch(() => eid);
-            eid = fresh || eid;
+            // HTTP 通道存在但 SW 休眠 → 无副作用唤醒（★避免 remove+load 杀面板世界），
+            // 仍找不到才走 wakeOne（全量重载 + id 同步）
+            const wakeA = this.host.wakeSw
+                ? async () => { await this.host.wakeSw!(eid); }
+                : async () => { eid = (await this.host.wakeOne(eid).then((r) => (typeof r === "string" ? r : eid)).catch(() => eid)) || eid; };
+            await wakeA();
             for (let i = 0; i < 10 && !target; i++) {
                 await new Promise((r) => setTimeout(r, 300));
                 target = await findSwTarget(eid);
             }
+            if (!target && this.host.wakeSw) {
+                const fresh = await this.host.wakeOne(eid).then((r) => (typeof r === "string" ? r : eid)).catch(() => eid);
+                eid = fresh || eid;
+                for (let i = 0; i < 10 && !target; i++) {
+                    await new Promise((r) => setTimeout(r, 300));
+                    target = await findSwTarget(eid);
+                }
+            }
         }
         if (!target) {
-            // flat 通道（正常启动）：SW 活着就直接 evaluate；不活着由 flat 内部 wake
+            // flat 通道（正常启动）：SW 活着就直接 evaluate；不活着由 flat 内部 wake。
+            // ★ wake 必须无副作用（startWorkerForScope）—— remove+load 会把正在打开的
+            //   面板世界连 binding 一起销毁，popup.js 首个 storage 调用永挂 → 面板全白
             const flat = await evalInSwFlat(
                 (method, params, sessionId) => Promise.race([
                     this.wc.debugger.sendCommand(method, params, sessionId),
@@ -977,7 +991,10 @@ class CsPageSession {
                 ]),
                 eid,
                 expr,
-                async () => { await this.host.wakeOne(eid); }
+                async () => {
+                    if (this.host.wakeSw) await this.host.wakeSw(eid);
+                    else await this.host.wakeOne(eid);
+                }
             );
             if (flat.err !== SW_FLAT_UNAVAILABLE) return flat;
             const alt = await evalInSwViaMainWindow(eid, expr);

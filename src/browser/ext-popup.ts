@@ -169,6 +169,22 @@ export const POPUP_JS_PRELUDE = `
             });
         }
     } catch (e) {}
+    // body class 镜像到面板宿主：scopeCss 把 body 选择器映射为宿主根
+    // （如 body:not(.popup-ready) → #sy-ext-popup-host:not(.popup-ready)），
+    // 而扩展把状态类（popup-ready 等）加在 body 上 —— 不同步则面板永远
+    // visibility:hidden（实测 Clip "点不开"的根因）
+    try {
+        var syncBodyClass = function () {
+            var h = document.getElementById("sy-ext-popup-host");
+            if (!h) return;
+            var cls = Array.prototype.slice.call(body.classList);
+            for (var i = 0; i < cls.length; i++) {
+                try { h.classList.add(cls[i]); } catch (e) {}
+            }
+        };
+        syncBodyClass();
+        new MutationObserver(syncBodyClass).observe(body, { attributes: true, attributeFilter: ["class"] });
+    } catch (e) {}
 })();
 `;
 

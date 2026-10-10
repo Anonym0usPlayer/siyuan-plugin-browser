@@ -511,6 +511,12 @@ export class BrowserTab {
             showMessage(`「${ext.name}」没有 popup 面板`, 4000, "info");
             return;
         }
+        // 预热 SW：面板脚本的首个 storage 调用若撞上 SW 冷启动会挂到超时（Clip 无重试
+        // 逻辑 → 面板全白"点不开"）。世界创建+脚本注入本身有 1-2s，唤醒并行完成。
+        try {
+            const wakeP = (window as any).browserPlugin?.extensionHost?.wakeSw?.(ext.electronId);
+            if (wakeP) await Promise.race([wakeP, new Promise((r) => setTimeout(r, 2500))]);
+        } catch {}
         // anchor 缺省（如从思源顶栏触发）：面板落在右上角
         const r = anchor
             ? anchor.getBoundingClientRect()
