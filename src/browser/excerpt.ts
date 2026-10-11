@@ -99,6 +99,8 @@ function formatClipExcerpt(excerpt: string): string {
     return text.trim();
 }
 
+export { formatClipExcerpt };
+
 function decodeClipUrl(href: string): string {
     try {
         return decodeURIComponent(href);
@@ -121,8 +123,8 @@ function getClipSimpleDateTime(): { date: string; time: string } {
     return { date: now.toISOString().slice(0, 10), time: now.toTimeString().slice(0, 5) };
 }
 
-/** 模板渲染（支持 ${var} 与 ${cond ? "a" : b} 条件表达式） */
-function renderClipTemplate(template: string, data: Record<string, any>): string {
+/** 模板渲染（支持 ${var} 与 ${cond ? "a" : b} 条件表达式；导出供原生剪藏链路复用） */
+export function renderClipTemplate(template: string, data: Record<string, any>): string {
     return template.replace(/\$\{([^}]+)\}/g, (_match, key: string) => {
         const conditionalMatch = key.match(/(.+?)\s*\?\s*(.*?)\s*:\s*(.*)/);
         if (conditionalMatch) {
@@ -156,8 +158,8 @@ function renderClipTemplate(template: string, data: Record<string, any>): string
     });
 }
 
-/** 模板渲染失败时的默认格式 */
-function getDefaultClipMarkdown(p: ClipPayload, contentMd: string): string {
+/** 模板渲染失败时的默认格式（导出供原生剪藏链路复用） */
+export function getDefaultClipMarkdown(p: ClipPayload, contentMd: string): string {
     let markdown = "---\n\n* " + (p.title || "Untitled");
     const siteName = p.siteName || "";
     if ("" !== siteName) {

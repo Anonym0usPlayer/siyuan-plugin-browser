@@ -30,6 +30,8 @@
  * 与 disposeCsRuntime 清理。
  */
 import type { IWebviewTag } from "../types";
+import { fetchSyncPost } from "siyuan";
+import { CLIP_DEFAULT_TEMPLATE, renderClipTemplate, getDefaultClipMarkdown, formatClipExcerpt } from "../browser/excerpt";
 import { CS_WORLD_PREFIX, cdpEvalOnce, cdpHttpLikelyDead, evalInSwFlat, evalInSwFlatCached, findSwFlatSession, findSwTarget, FlatCommandSender, SW_FLAT_UNAVAILABLE } from "./sw-bridge";
 
 const BRIDGE_NAME = "__syExtHost";
@@ -355,6 +357,8 @@ class CsPageSession {
     private swReplyPumps = new Map<string, { deadline: number; busy: boolean; timer: ReturnType<typeof setInterval> }>();
     /** 大消息分块缓冲：id → 分块数组（binding 通道挂大 payload，CS 切块过桥、此处拼装） */
     private bigMsgBuffers = new Map<string, { parts: (string | null)[]; received: number; total: number; ts: number }>();
+    /** Clip 自定义剪藏模板缓存（SW storage 读取慢，后台刷新供后续剪藏直用） */
+    private clipTemplateCache = new Map<string, string>();
 
     constructor(
         private wc: any,
@@ -727,6 +731,22 @@ class CsPageSession {
 
     private async route(ext: ICsExtInfo, req: any): Promise<{ data?: any; err?: string }> {
         const args = req.args || {};
+        const msg = args.msg;
+        if (msg && typeof msg === "object" && msg.func) {
+            // ★ 原生通讯链路：SiYuan Clip 的剪藏/校验由宿主直连内核执行 —— 主窗口
+            //   与内核同源（https://127.0.0.1:<port>/stage/），FormData/fetch 原生
+            //   可用，完全绕开 SW handler 与 SW→CS 回程泵。完成 tip 由宿主经
+            //   dispatchToContentWorld 直达 content 世界（单次 evaluate，无 outbox
+            //   无轮询），处理结束立即提醒；也不再受 SW 空闲回收影响（keepalive
+            //   仅为其它经 SW 的扩展调用保留）。
+            if (msg.func === "upload-copy") {
+                await this.handleUploadCopyNatively(ext, msg.data || {});
+                return { data: null };
+            }
+            if (msg.func === "check-kernel") {
+                return { data: await this.handleCheckKernelNatively(msg.data || {}) };
+            }
+        }
         if (req.type === "storage") {
             const op = String(args.op || "get");
             // sync/session 代理到 local（与扩展页垫片 83a6d9b 同策略）
@@ -905,6 +925,196 @@ class CsPageSession {
             this.stopSwReplyPump(electronId, entry);
         } finally {
             entry.busy = false;
+        }
+    }
+
+    /** tip 直达派发：宿主 → content 世界的 onMessage 监听器（单次 evaluate） */
+    private async dispatchTip(ext: ICsExtInfo, payload: Record<string, any>): Promise<void> {
+        try {
+            await this.dispatchToContentWorld(ext, {
+                msg: payload,
+                tabId: typeof payload.tabId === "number" ? payload.tabId : undefined,
+                senderUrl: `chrome-extension://${ext.electronId}/background.js`,
+            });
+        } catch {}
+    }
+
+    /** ★ 原生通讯链路：SiYuan Clip 的剪藏由宿主直连内核执行（主窗口与内核同源，
+     *  FormData/fetch 原生可用），完全绕开 SW handler 与 SW→CS 回程泵 —— 完成 tip
+     *  由宿主直达 content 世界（dispatchToContentWorld 单次 evaluate），处理结束
+     *  立即提醒，不再受 SW 空闲回收影响（keepalive 仅为其它经 SW 的扩展调用保留）。
+     *  语义对齐 Clip background.js 的 handleUploadCopy/handleArticleClip：
+     *  /api/extension/copy → 模板组装 →（数据库模板 | createDocWithMd）→
+     *  数据库归属 → tip_clip_ok；图片转换兜底 fire-and-forget。 */
+    private async handleUploadCopyNatively(ext: ICsExtInfo, data: Record<string, any>): Promise<void> {
+        const tip = String(data.tip || "tip");
+        const sendTipKey = (key: string) => this.dispatchTip(ext, { func: "tipKey", msg: key, tip, tabId: data.tabId });
+        const sendTipText = (text: string) => this.dispatchTip(ext, { func: "tip", msg: text, tip, tabId: data.tabId });
+        try {
+            // 1. /api/extension/copy（lute 转 Markdown + assets 资源下载，主耗时所在）
+            const form = new FormData();
+            form.append("dom", String(data.dom || ""));
+            for (const key of Object.keys(data.files || {})) {
+                const f = data.files[key];
+                form.append(key, await fetch(String(f.data)).then((r) => r.blob()));
+            }
+            form.append("notebook", String(data.notebook || ""));
+            form.append("href", String(data.href || ""));
+            form.append("tags", String(data.tags || ""));
+            form.append("clipType", String(data.type || "article"));
+            form.append("assets", String(data.assets ?? false));
+            const copyResp = await fetch("/api/extension/copy", { method: "POST", body: form });
+            const copyResult: any = await copyResp.json();
+            if (copyResult.code < 0) {
+                sendTipText(copyResult.msg || "copy failed");
+                return;
+            }
+            const md = String(copyResult.data?.md || "");
+            const withMath = copyResult.data?.withMath;
+
+            // 2. 模板组装（用户自定义模板存于 Clip 的 SW storage：3s 内读到则用之并
+            //    缓存，读不到（SW 未运行等）用默认模板，后台读到后更新缓存供下次）
+            let title = String(data.title || "") || "Untitled";
+            title = title.replace(/[\\/]/g, "／") || "Untitled";
+            let clipTemplate = CLIP_DEFAULT_TEMPLATE;
+            const cachedTpl = this.clipTemplateCache.get(ext.electronId);
+            if (cachedTpl) {
+                clipTemplate = cachedTpl;
+            } else {
+                const readP = this.evalInSwAny(ext.electronId, `(async () => JSON.stringify(await chrome.storage.local.get(["clipTemplate"])))()`).catch(() => null);
+                const r = await Promise.race([
+                    readP,
+                    new Promise((res) => setTimeout(() => res(null), 3000)),
+                ]);
+                if (r && !r.err) {
+                    try {
+                        const parsed = JSON.parse(String(r.value || "{}"));
+                        if (parsed.clipTemplate) {
+                            clipTemplate = String(parsed.clipTemplate);
+                            this.clipTemplateCache.set(ext.electronId, clipTemplate);
+                        }
+                    } catch {}
+                }
+                // 后台刷新缓存供下次使用（不阻塞本次剪藏）
+                readP?.then((rr) => {
+                    if (rr && !rr.err) {
+                        try {
+                            const parsed = JSON.parse(String(rr.value || "{}"));
+                            if (parsed.clipTemplate) this.clipTemplateCache.set(ext.electronId, String(parsed.clipTemplate));
+                        } catch {}
+                    }
+                }).catch(() => {});
+            }
+            const href = String(data.href || "");
+            let urlDecoded = href;
+            try { urlDecoded = decodeURIComponent(href); } catch {}
+            const tplData = {
+                title,
+                siteName: String(data.siteName || ""),
+                excerpt: formatClipExcerpt(String(data.excerpt || "")),
+                url: href,
+                urlDecoded,
+                date: new Date().toISOString().slice(0, 10),
+                time: new Date().toTimeString().slice(0, 5),
+                tags: String(data.tags || ""),
+                content: md,
+            };
+            let markdown: string;
+            try {
+                markdown = renderClipTemplate(clipTemplate, tplData);
+            } catch {
+                markdown = getDefaultClipMarkdown({ ok: true, dom: "", files: {}, title: tplData.title, siteName: tplData.siteName, excerpt: tplData.excerpt, href, fetchFileErr: false }, md);
+            }
+
+            // 3. 保存路径（search 直接拼接；template 走 renderSprig）
+            let parentPath = String(data.savePathTemplate || "/");
+            if (String(data.savePathMode) === "template") {
+                const sprig: any = await fetchSyncPost("/api/template/renderSprig", { template: parentPath || "/" });
+                if (sprig?.code !== 0 || typeof sprig?.data !== "string") {
+                    if (sprig?.msg) sendTipText(sprig.msg); else sendTipKey("tip_siyuan_kernel_unavailable");
+                    return;
+                }
+                parentPath = String(sprig.data);
+            }
+            let path = parentPath.split("\\").join("/").replace(/\/{2,}/g, "/");
+            if (!path.startsWith("/")) path = "/" + path;
+            if (path.length > 1) path = path.replace(/\/+$/, "");
+            path = (path === "/" ? "" : path) + "/" + title;
+
+            // 4. 创建文档（数据库模板入口 | 常规 createDocWithMd）
+            let docId = "";
+            if (data.selectedDatabaseTemplateID) {
+                const r: any = await fetchSyncPost("/api/av/createAttributeViewItemWithMarkdown", {
+                    avID: data.selectedDatabaseTemplateID,
+                    blockID: data.selectedDatabaseBlockID || "",
+                    viewID: data.selectedDatabaseViewID || "",
+                    templateID: data.selectedDatabaseTemplateID,
+                    title,
+                    markdown,
+                    tags: String(data.tags || ""),
+                    withMath,
+                    clippingHref: href,
+                    listDocTree: data.listDocTree ?? false,
+                });
+                if (r?.code !== 0) { sendTipText(r?.msg || "database create failed"); return; }
+                docId = String(r.data?.blockID || "");
+            } else {
+                const r: any = await fetchSyncPost("/api/filetree/createDocWithMd", {
+                    notebook: String(data.notebook || ""),
+                    parentID: String(data.parentDoc || ""),
+                    tags: String(data.tags || ""),
+                    path,
+                    markdown,
+                    withMath,
+                    clippingHref: href,
+                    listDocTree: data.listDocTree ?? false,
+                });
+                if (r?.code !== 0) {
+                    // 对齐 Clip 语义：有 msg 显示文案；code===1 → tip_save_path_miss
+                    if (r?.msg) sendTipText(r.msg); else sendTipKey(r?.code === 1 ? "tip_save_path_miss" : "tip_siyuan_kernel_unavailable");
+                    return;
+                }
+                docId = String(r.data || "");
+            }
+            if (!docId) { sendTipKey("tip_siyuan_kernel_unavailable"); return; }
+
+            // 5. 数据库归属（flushTransaction 后 addAttributeViewBlocks）
+            if (!data.selectedDatabaseTemplateID && data.selectedDatabaseID) {
+                try {
+                    await fetchSyncPost("/api/sqlite/flushTransaction", {});
+                    await fetchSyncPost("/api/av/addAttributeViewBlocks", {
+                        avID: data.selectedDatabaseID,
+                        srcs: [{ id: docId, isDetached: false }],
+                    });
+                } catch {}
+            }
+
+            // 6. 完成 tip（宿主直达，立即提醒）
+            await sendTipKey("tip_clip_ok");
+
+            // 7. 图片抓取失败 → 网络图片转本地兜底（fire-and-forget）
+            if (data.fetchFileErr) {
+                fetchSyncPost("/api/format/netImg2LocalAssets", { id: docId, url: href }).catch(() => {});
+            }
+        } catch (e: any) {
+            try { await sendTipText(String(e?.message || e).slice(0, 120)); } catch {}
+        }
+    }
+
+    /** ★ 原生通讯链路：check-kernel 由宿主直连内核校验（token/notebook/笔记本状态） */
+    private async handleCheckKernelNatively(data: Record<string, any>): Promise<{ ok?: boolean; error?: string }> {
+        try {
+            const token = String(data.token || "");
+            const notebook = String(data.notebook || "");
+            if (!token || !notebook) return { ok: false, error: "tip_save_path_miss" };
+            const r: any = await fetchSyncPost("/api/notebook/lsNotebooks", {});
+            const notebooks = r?.data?.notebooks || [];
+            if (!Array.isArray(notebooks) || !notebooks.some((n: any) => n.id === notebook && !n.closed)) {
+                return { ok: false, error: "tip_save_path_miss" };
+            }
+            return { ok: true };
+        } catch {
+            return { ok: false, error: "tip_siyuan_kernel_unavailable" };
         }
     }
 
