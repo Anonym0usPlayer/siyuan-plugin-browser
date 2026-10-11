@@ -268,7 +268,8 @@ export default class BrowserPlugin extends Plugin {
                     plugin.i18n,
                     (url) => plugin.openUrl(url),
                     (url, name) => plugin.startDownload(url, name),
-                    (item) => plugin.openDownloadedFile(item)
+                    (item) => plugin.openDownloadedFile(item),
+                    (item) => plugin.showDownloadedInFolder(item)
                 );
                 dock.init();
                 plugin.dockInstances.set(DOCK_DOWNLOADS, dock);
@@ -1121,6 +1122,42 @@ export default class BrowserPlugin extends Plugin {
             }
         } catch (e: any) {
             showMessage("Open failed: " + (e?.message || e), 3000, "error");
+        }
+    }
+
+    /** 在系统文件管理器中定位已下载文件（打开文件位置） */
+    showDownloadedInFolder(item: { savePath: string }): void {
+        if (!item.savePath) {
+            showMessage("File path missing", 2000, "info");
+            return;
+        }
+        try {
+            // savePath 两种形态 → 绝对磁盘路径：
+            //   assets/<file>          → <工作空间>/data/assets/<file>
+            //   downloads/<file>       → <工作空间>/data/storage/petal/siyuan-plugin-browser/downloads/<file>
+            const wsDir = String((window as any).siyuan?.config?.system?.workspaceDir || "").replace(/[\\/]+$/, "");
+            if (!wsDir) {
+                showMessage("Workspace dir missing", 3000, "error");
+                return;
+            }
+            let abs: string;
+            if (item.savePath.startsWith("assets/")) {
+                abs = wsDir + "/data/" + item.savePath;
+            } else if (item.savePath.startsWith("downloads/")) {
+                abs = wsDir + "/data/storage/petal/siyuan-plugin-browser/" + item.savePath;
+            } else {
+                showMessage("Saved to: " + item.savePath, 5000, "info");
+                return;
+            }
+            const remote = (window as any).require("@electron/remote");
+            if (!remote?.shell?.showItemInFolder) {
+                showMessage("shell.showItemInFolder unavailable", 3000, "error");
+                return;
+            }
+            const ok = remote.shell.showItemInFolder(abs);
+            if (!ok) showMessage("File not found: " + abs, 4000, "error");
+        } catch (e: any) {
+            showMessage("Show in folder failed: " + (e?.message || e), 3000, "error");
         }
     }
 

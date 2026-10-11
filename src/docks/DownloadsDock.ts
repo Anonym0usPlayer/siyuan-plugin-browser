@@ -15,6 +15,8 @@ export class DownloadsDock {
     private redownload: (url: string, suggestedName?: string) => Promise<void>;
     /** 打开已下载文件所在的思源资源路径 */
     private openFile?: (item: DownloadItem) => void;
+    /** 在系统文件管理器中定位已下载文件 */
+    private showInFolder?: (item: DownloadItem) => void;
     private unsubscribe?: () => void;
 
     constructor(
@@ -22,13 +24,15 @@ export class DownloadsDock {
         i18n: Record<string, string>,
         openUrl: (url: string) => void,
         redownload: (url: string, suggestedName?: string) => Promise<void>,
-        openFile?: (item: DownloadItem) => void
+        openFile?: (item: DownloadItem) => void,
+        showInFolder?: (item: DownloadItem) => void
     ) {
         this.store = store;
         this.i18n = i18n;
         this.openUrl = openUrl;
         this.redownload = redownload;
         this.openFile = openFile;
+        this.showInFolder = showInFolder;
         this.element = this.build();
         this.list = this.element.querySelector(".sy-browser-dock-list")!;
     }
@@ -112,6 +116,14 @@ export class DownloadsDock {
                 iconHTML: "",
                 label: this.i18n.open,
                 click: () => this.openFile?.(item),
+            });
+        }
+        if (item.state === "completed" && this.showInFolder) {
+            menu.addItem({
+                id: "showInFolder",
+                iconHTML: "",
+                label: this.i18n.openFolder || "打开文件位置",
+                click: () => this.showInFolder?.(item),
             });
         }
         menu.addItem({
