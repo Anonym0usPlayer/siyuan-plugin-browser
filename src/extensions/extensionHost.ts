@@ -179,7 +179,7 @@ export class ExtensionHost {
      */
     private async injectBackgroundShims(): Promise<void> {
         const { fs, path } = nodeModules();
-        const SHIM_MARK = "/* sy-bg-shim:v14 */";
+        const SHIM_MARK = "/* sy-bg-shim:v15 */";
         let changedShimCount = 0;
         for (const ext of this.extensions) {
             try {
@@ -196,6 +196,12 @@ export class ExtensionHost {
 ;(function () {
     try {
         if (typeof chrome === "undefined") return;
+        // 0) onMessage handlers 收集数组：无条件最顶部创建 —— background 顶层的
+        //    addListener 稍后 push 进同一数组；宿主 routeSendMessage 据此判断
+        //    "handler 已注册（非空）" 还是 "仍在启动期（空 → 重试）"。
+        //    （此前数组在 onMessage 包装内创建，若包装条件不满足则数组缺失，
+        //    宿主会误报 "垫片未运行" 且无重试依据。）
+        self.__syOnMessageHandlers = self.__syOnMessageHandlers || [];
         // 1) 通用存在性垫片：background 里引用到的缺失命名空间统一补空壳，
         //    否则任何一处 undefined 访问都会让 SW 整个崩掉（实测 SiYuan Clip
         //    第一行 contextMenus、中段 commands 各崩一次）。

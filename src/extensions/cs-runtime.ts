@@ -1193,22 +1193,24 @@ class CsPageSession {
         try {
             let parsed = JSON.parse(String(r.value));
             // SW 刚被 loadExtension 唤醒时 app 尚在初始化（AdGuard 过滤器加载 5-10s），
-            // handler 注册滞后 → __noHandlers 重试几轮，覆盖首开窗口期
+            // SW 冷启动期：background 顶层 addListener 尚未执行（handlers 数组为空）
+            // → __noHandlers 重试（8 轮 × 2s ≈ 16s，覆盖扩展 background 的启动时长；
+            // 须 < 桥超时 25s）。重试耗尽仍空 = 真实故障（垫片/handler 注册异常）。
             let tries = 0;
-            while (parsed && parsed.__noHandlers && tries < 3) {
+            while (parsed && parsed.__noHandlers && tries < 8) {
                 tries++;
-                await new Promise((res) => setTimeout(res, 1500));
+                console.warn("[browser-plugin] SW handlers 未就绪，重试", tries + "/8");
+                await new Promise((res) => setTimeout(res, 2000));
                 const r2 = await this.evalInSw(ext, expr);
                 if (r2.err) return { err: r2.err };
                 parsed = JSON.parse(String(r2.value));
             }
             if (parsed && parsed.__noHandlers) {
-                // 对齐 Chrome 语义：onMessage listener 存在但 handler 未注册/无响应 →
-                // 无响应数据（fire-and-forget 调用方无感；此前返回 err 会让调用方
-                // Uncaught "扩展 SW 无 onMessage 处理器"）。保留 warn 作诊断线索。
-                console.warn("[browser-plugin] SW 无 onMessage 处理器（垫片未运行？），func:",
+                // 重试耗尽仍无 handler：真实故障态。返回 err（调用方 Uncaught 可见），
+                // 此前的静默降级会让 fire-and-forget 剪藏无声失败。
+                console.warn("[browser-plugin] SW handlers 重试耗尽仍为空，func:",
                     (() => { try { return JSON.parse(String(args.msg === undefined ? "null" : args.msg))?.func || "?"; } catch { return "?"; } })());
-                return { data: undefined };
+                return { err: "扩展 SW 无 onMessage 处理器（重试 8 轮仍为空）" };
             }
             return { data: parsed === null ? undefined : parsed };
         } catch {
