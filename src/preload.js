@@ -12,7 +12,37 @@
  */
 (function () {
     try {
-        const { ipcRenderer } = require("electron");
+        const { ipcRenderer, webFrame } = require("electron");
+
+        // === 0. Ctrl+滚轮 / Ctrl+0 页面缩放（Chromium page zoom，webFrame 渲染进程标准 API）===
+        // 缩放后固定宽度站点会横向溢出并出现滚动条（与真浏览器行为一致）。
+        try {
+            const ZOOM_MIN = 0.25;
+            const ZOOM_MAX = 3;
+            window.addEventListener(
+                "wheel",
+                (e) => {
+                    if (!e.ctrlKey) return;
+                    e.preventDefault();
+                    const cur = webFrame.getZoomFactor();
+                    const next = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, cur * (e.deltaY < 0 ? 1.1 : 1 / 1.1)));
+                    if (Math.abs(next - cur) > 1e-6) webFrame.setZoomFactor(next);
+                },
+                { passive: false }
+            );
+            window.addEventListener(
+                "keydown",
+                (e) => {
+                    if (e.ctrlKey && !e.shiftKey && !e.altKey && (e.key === "0" || e.code === "Digit0")) {
+                        e.preventDefault();
+                        webFrame.setZoomLevel(0); // 0 = 100%
+                    }
+                },
+                { passive: false }
+            );
+        } catch (e) {
+            console.warn("[browser-preload] zoom init failed:", e);
+        }
 
         const openInNewTab = function (rawUrl) {
             if (!rawUrl) return;
