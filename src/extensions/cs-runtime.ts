@@ -37,6 +37,8 @@ import { CS_WORLD_PREFIX, cdpEvalOnce, cdpHttpLikelyDead, evalInSwFlat, evalInSw
 const BRIDGE_NAME = "__syExtHost";
 /** popup/options 页专属世界前缀（独立于 content 世界，避免顶层声明冲突） */
 const POPUP_WORLD_PREFIX = "__syCsPop_";
+/** Clip 自定义剪藏模板缓存（模块级：manager（seed 预读）与 CsPageSession（剪藏直用）共享） */
+const clipTemplateCache = new Map<string, string>();
 
 /** SW→CS 回程监听窗口时长（routeSendMessage 派发后轮询 SW 垫片 outbox 的时间上限）。
  *  剪藏大流程（多图下载）可远超短窗口且中途可能无 tip → 窗口必须覆盖全程，
@@ -307,17 +309,23 @@ class CsRuntimeManager {
                     //（startWorkerForScope；SW 已运行时为 no-op）
                     await this.host.wakeSw?.(clip.electronId);
                     const expr = `(async () => {
-                        const cur = await chrome.storage.local.get(["ip", "token"]);
+                        const cur = await chrome.storage.local.get(["ip", "token", "clipTemplate"]);
                         const patch = {};
                         const wantIp = ${JSON.stringify(ip)};
                         const wantToken = ${JSON.stringify(token)};
                         if (cur.ip !== wantIp) patch.ip = wantIp;
                         if (wantToken && cur.token !== wantToken) patch.token = wantToken;
                         if (Object.keys(patch).length) await chrome.storage.local.set(patch);
-                        return JSON.stringify({ changed: Object.keys(patch).length > 0 });
+                        // clipTemplate 一并带回：宿主预缓存后，剪藏时模板零 SW 查询
+                        return JSON.stringify({ changed: Object.keys(patch).length > 0, clipTemplate: cur.clipTemplate || null });
                     })()`;
                     const r = await this.evalInSwAny(clip.electronId, expr);
                     if (!r.err) {
+                        try {
+                            const parsed = JSON.parse(String(r.value || "{}"));
+                            // 无论有无自定义模板都记录（null = 用户未自定义 → 剪藏时直用默认模板）
+                            clipTemplateCache.set(clip.electronId, parsed.clipTemplate ? String(parsed.clipTemplate) : CLIP_DEFAULT_TEMPLATE);
+                        } catch {}
                         console.log("[browser-plugin] seed kernel settings ok (attempt", attempt + 1 + "):", String(r.value || ""));
                         return;
                     }
@@ -357,8 +365,6 @@ class CsPageSession {
     private swReplyPumps = new Map<string, { deadline: number; busy: boolean; timer: ReturnType<typeof setInterval> }>();
     /** 大消息分块缓冲：id → 分块数组（binding 通道挂大 payload，CS 切块过桥、此处拼装） */
     private bigMsgBuffers = new Map<string, { parts: (string | null)[]; received: number; total: number; ts: number }>();
-    /** Clip 自定义剪藏模板缓存（SW storage 读取慢，后台刷新供后续剪藏直用） */
-    private clipTemplateCache = new Map<string, string>();
 
     constructor(
         private wc: any,
@@ -931,12 +937,16 @@ class CsPageSession {
     /** tip 直达派发：宿主 → content 世界的 onMessage 监听器（单次 evaluate） */
     private async dispatchTip(ext: ICsExtInfo, payload: Record<string, any>): Promise<void> {
         try {
+            console.log(`[browser-plugin] dispatchTip begin func=${payload.func} msg=${String(payload.msg).slice(0, 40)}`);
             await this.dispatchToContentWorld(ext, {
                 msg: payload,
                 tabId: typeof payload.tabId === "number" ? payload.tabId : undefined,
                 senderUrl: `chrome-extension://${ext.electronId}/background.js`,
             });
-        } catch {}
+            console.log("[browser-plugin] dispatchTip done");
+        } catch (e: any) {
+            console.warn("[browser-plugin] dispatchTip ERR:", String(e?.message || e).slice(0, 120));
+        }
     }
 
     /** ★ 原生通讯链路：SiYuan Clip 的剪藏由宿主直连内核执行（主窗口与内核同源，
@@ -947,6 +957,9 @@ class CsPageSession {
      *  /api/extension/copy → 模板组装 →（数据库模板 | createDocWithMd）→
      *  数据库归属 → tip_clip_ok；图片转换兜底 fire-and-forget。 */
     private async handleUploadCopyNatively(ext: ICsExtInfo, data: Record<string, any>): Promise<void> {
+        const nativeT0 = Date.now();
+        const nativeLog = (step: string) => console.log(`[browser-plugin] native-clip [${Date.now() - nativeT0}ms] ${step}`);
+        nativeLog("start, dom=" + String(data.dom || "").length + "B files=" + Object.keys(data.files || {}).length);
         const tip = String(data.tip || "tip");
         const sendTipKey = (key: string) => this.dispatchTip(ext, { func: "tipKey", msg: key, tip, tabId: data.tabId });
         const sendTipText = (text: string) => this.dispatchTip(ext, { func: "tip", msg: text, tip, tabId: data.tabId });
@@ -965,6 +978,7 @@ class CsPageSession {
             form.append("assets", String(data.assets ?? false));
             const copyResp = await fetch("/api/extension/copy", { method: "POST", body: form });
             const copyResult: any = await copyResp.json();
+            nativeLog("copy done, code=" + copyResult.code);
             if (copyResult.code < 0) {
                 sendTipText(copyResult.msg || "copy failed");
                 return;
@@ -972,39 +986,22 @@ class CsPageSession {
             const md = String(copyResult.data?.md || "");
             const withMath = copyResult.data?.withMath;
 
-            // 2. 模板组装（用户自定义模板存于 Clip 的 SW storage：3s 内读到则用之并
-            //    缓存，读不到（SW 未运行等）用默认模板，后台读到后更新缓存供下次）
+            // 2. 模板组装（★ 零阻塞：模板只从模块级缓存/默认取——SW storage 读取全部
+            //    后台化（probe 阻塞查询实测会挂死 native 流程）。seed 启动时预填缓存；
+            //    用户中途改模板经后台刷新在下次剪藏生效）
             let title = String(data.title || "") || "Untitled";
             title = title.replace(/[\\/]/g, "／") || "Untitled";
-            let clipTemplate = CLIP_DEFAULT_TEMPLATE;
-            const cachedTpl = this.clipTemplateCache.get(ext.electronId);
-            if (cachedTpl) {
-                clipTemplate = cachedTpl;
-            } else {
-                const readP = this.evalInSwAny(ext.electronId, `(async () => JSON.stringify(await chrome.storage.local.get(["clipTemplate"])))()`).catch(() => null);
-                const r = await Promise.race([
-                    readP,
-                    new Promise((res) => setTimeout(() => res(null), 3000)),
-                ]);
-                if (r && !r.err) {
+            let clipTemplate = clipTemplateCache.get(ext.electronId) || CLIP_DEFAULT_TEMPLATE;
+            this.evalInSw(ext.electronId, `(async () => JSON.stringify(await chrome.storage.local.get(["clipTemplate"])))()`).then((rr) => {
+                if (rr && !rr.err) {
                     try {
-                        const parsed = JSON.parse(String(r.value || "{}"));
-                        if (parsed.clipTemplate) {
-                            clipTemplate = String(parsed.clipTemplate);
-                            this.clipTemplateCache.set(ext.electronId, clipTemplate);
-                        }
+                        const parsed = JSON.parse(String(rr.value || "{}"));
+                        if (parsed.clipTemplate) clipTemplateCache.set(ext.electronId, String(parsed.clipTemplate));
+                        else clipTemplateCache.set(ext.electronId, CLIP_DEFAULT_TEMPLATE);
                     } catch {}
                 }
-                // 后台刷新缓存供下次使用（不阻塞本次剪藏）
-                readP?.then((rr) => {
-                    if (rr && !rr.err) {
-                        try {
-                            const parsed = JSON.parse(String(rr.value || "{}"));
-                            if (parsed.clipTemplate) this.clipTemplateCache.set(ext.electronId, String(parsed.clipTemplate));
-                        } catch {}
-                    }
-                }).catch(() => {});
-            }
+            }).catch(() => {});
+            nativeLog("template ready, len=" + clipTemplate.length);
             const href = String(data.href || "");
             let urlDecoded = href;
             try { urlDecoded = decodeURIComponent(href); } catch {}
@@ -1040,6 +1037,7 @@ class CsPageSession {
             if (!path.startsWith("/")) path = "/" + path;
             if (path.length > 1) path = path.replace(/\/+$/, "");
             path = (path === "/" ? "" : path) + "/" + title;
+            nativeLog("path ready: " + path);
 
             // 4. 创建文档（数据库模板入口 | 常规 createDocWithMd）
             let docId = "";
@@ -1090,14 +1088,17 @@ class CsPageSession {
             }
 
             // 6. 完成 tip（宿主直达，立即提醒）
+            nativeLog("db done → dispatching tip_clip_ok");
             await sendTipKey("tip_clip_ok");
+            nativeLog("tip_clip_ok dispatched");
 
             // 7. 图片抓取失败 → 网络图片转本地兜底（fire-and-forget）
             if (data.fetchFileErr) {
                 fetchSyncPost("/api/format/netImg2LocalAssets", { id: docId, url: href }).catch(() => {});
             }
         } catch (e: any) {
-            try { await sendTipText(String(e?.message || e).slice(0, 120)); } catch {}
+            nativeLog("EXCEPTION after copy: " + String(e?.message || e).slice(0, 150));
+            try { await sendTipText(String(e?.message || e).slice(0, 120)); } catch (e2) { nativeLog("error tip dispatch failed: " + String(e2?.message || e2).slice(0, 100)); }
         }
     }
 
@@ -1173,7 +1174,10 @@ class CsPageSession {
                         } else if (r !== undefined) {
                             if (typeof r.then === "function") {
                                 asyncWait = true;
-                                r.then(useValue, () => finish(undefined));
+                                // async handler resolve undefined（fire-and-forget 型，
+                                // 如 Clip eventDispatcher 处理完 tip 直接 return）→
+                                // 必须立即 finish，否则挂到 20s 兜底（完成提示延迟的真凶）
+                                r.then((v) => { if (v === undefined) finish(undefined); else useValue(v); }, () => finish(undefined));
                             } else {
                                 finish(r);
                                 break;
@@ -1378,7 +1382,10 @@ class CsPageSession {
                                 } else if (r !== undefined) {
                                     if (typeof r.then === "function") {
                                         asyncWait = true;
-                                        r.then(useValue, () => finish(undefined));
+                                        // async handler resolve undefined（fire-and-forget 型，
+                                // 如 Clip eventDispatcher 处理完 tip 直接 return）→
+                                // 必须立即 finish，否则挂到 20s 兜底（完成提示延迟的真凶）
+                                r.then((v) => { if (v === undefined) finish(undefined); else useValue(v); }, () => finish(undefined));
                                     } else {
                                         finish(r);
                                         break;
