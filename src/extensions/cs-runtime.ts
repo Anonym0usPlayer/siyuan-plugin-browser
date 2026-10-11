@@ -922,6 +922,24 @@ class CsPageSession {
         const expr = `(async () => {
             const fns = self.__syOnMessageHandlers || [];
             if (!fns.length) return JSON.stringify({ __noHandlers: true });
+            // ★ SW keepalive：扩展 handler 常为 fire-and-forget（实测 SiYuan Clip
+            //   onMessage 里 void handleUploadCopy(...)）——事件回调同步返回后 SW
+            //   开始 30s 空闲倒计时，多图剪藏处理超 30s 会被回收中断（文档未建完、
+            //   完成_tip 永不发出，用户挂在"剪藏中"很久）。每 20s 一次 runtime API
+            //   心跳重置空闲计时，窗口 4 分钟，到期自动停。
+            if (!self.__syKeepAliveUntil || Date.now() > self.__syKeepAliveUntil) {
+                self.__syKeepAliveUntil = Date.now() + 240000;
+                if (!self.__syKeepAliveTimer) {
+                    self.__syKeepAliveTimer = setInterval(function () {
+                        if (Date.now() > (self.__syKeepAliveUntil || 0)) {
+                            clearInterval(self.__syKeepAliveTimer);
+                            self.__syKeepAliveTimer = null;
+                            return;
+                        }
+                        try { chrome.runtime.getPlatformInfo(function () {}); } catch (e) {}
+                    }, 20000);
+                }
+            }
             return await new Promise((resolve) => {
                 let done = false;
                 const finish = (v) => {
