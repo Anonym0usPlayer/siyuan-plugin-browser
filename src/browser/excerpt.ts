@@ -224,6 +224,13 @@ function dataUrlToBlob(dataUrl: string): Promise<Blob> {
     return fetch(dataUrl).then((r) => r.blob());
 }
 
+/** 摘录进度消息 id（思源 showMessage 同 id 调用会原地更新内容与消失计时）：
+ *  大页面 /api/extension/copy（assets 开启时内核同步下载全部网络图片）可持续
+ *  数十秒到数分钟 —— 进行中提示必须长显并在此 id 下流转，否则 2s 后消失，
+ *  用户长时间无反馈（完成提示看起来"过很久才出现"）。 */
+const EXCERPT_PROGRESS_ID = "sy-excerpt-progress";
+const EXCERPT_PROGRESS_TIMEOUT = 600000;
+
 /**
  * 执行剪藏：从 webview 收集内容并保存到思源。
  * - article：整页摘录（Readability），创建新文档
@@ -248,25 +255,25 @@ export async function clipToSiYuan(
         }
     }
 
-    showMessage(i18n.excerpt + "...", 2000, "info");
+    showMessage(i18n.excerpt + "...", EXCERPT_PROGRESS_TIMEOUT, "info", EXCERPT_PROGRESS_ID);
 
     let payload: ClipPayload;
     try {
         payload = await runClipScript(webview, opts);
     } catch (e: any) {
         console.error("[browser-plugin] runClipScript failed:", e);
-        showMessage(i18n.excerptFailed + ": " + (e?.message || e), 4000, "error");
+        showMessage(i18n.excerptFailed + ": " + (e?.message || e), 4000, "error", EXCERPT_PROGRESS_ID);
         return;
     }
     if (!payload?.ok) {
         const reason = payload?.error === "no_selection" ? (i18n.excerptNoSelection || "no selection")
             : payload?.error === "readability_failed" ? (i18n.excerptReadabilityFailed || "readability failed")
             : (payload?.error || "extract failed");
-        showMessage(i18n.excerptFailed + ": " + reason, 4000, "error");
+        showMessage(i18n.excerptFailed + ": " + reason, 4000, "error", EXCERPT_PROGRESS_ID);
         return;
     }
     if (!payload.dom) {
-        showMessage(i18n.excerptFailed + ": content empty", 3000, "error");
+        showMessage(i18n.excerptFailed + ": content empty", 3000, "error", EXCERPT_PROGRESS_ID);
         return;
     }
 
@@ -289,14 +296,14 @@ export async function clipToSiYuan(
         const resp = await fetch("/api/extension/copy", { method: "POST", body: form });
         const copyResult = await resp.json();
         if (copyResult.code < 0) {
-            showMessage(i18n.excerptFailed + ": " + copyResult.msg, 4000, "error");
+            showMessage(i18n.excerptFailed + ": " + copyResult.msg, 4000, "error", EXCERPT_PROGRESS_ID);
             return;
         }
         md = copyResult.data?.md || "";
         withMath = copyResult.data?.withMath;
     } catch (e: any) {
         console.error("[browser-plugin] /api/extension/copy failed:", e);
-        showMessage(i18n.excerptFailed + ": " + (e?.message || e), 4000, "error");
+        showMessage(i18n.excerptFailed + ": " + (e?.message || e), 4000, "error", EXCERPT_PROGRESS_ID);
         return;
     }
 
@@ -304,12 +311,12 @@ export async function clipToSiYuan(
     if (opts.mode === "part") {
         const { copyText } = await import("../utils/dom");
         await copyText(md);
-        showMessage(i18n.excerptComplete + " → " + (i18n.clipboard || "clipboard"), 3000, "info");
+        showMessage(i18n.excerptComplete + " → " + (i18n.clipboard || "clipboard"), 3000, "info", EXCERPT_PROGRESS_ID);
         return;
     }
 
     if (!md) {
-        showMessage(i18n.excerptFailed + ": empty markdown", 3000, "error");
+        showMessage(i18n.excerptFailed + ": empty markdown", 3000, "error", EXCERPT_PROGRESS_ID);
         return;
     }
 
@@ -321,7 +328,7 @@ export async function clipToSiYuan(
     if (parentPath.includes("{{")) {
         const rendered = await renderSprigPath(parentPath);
         if (rendered == null) {
-            showMessage(i18n.excerptFailed + ": renderSprig", 4000, "error");
+            showMessage(i18n.excerptFailed + ": renderSprig", 4000, "error", EXCERPT_PROGRESS_ID);
             return;
         }
         parentPath = rendered;
@@ -340,11 +347,11 @@ export async function clipToSiYuan(
             listDocTree: false,
         });
         if (resp?.code !== 0) {
-            showMessage(i18n.excerptFailed + ": " + (resp?.msg || "unknown"), 4000, "error");
+            showMessage(i18n.excerptFailed + ": " + (resp?.msg || "unknown"), 4000, "error", EXCERPT_PROGRESS_ID);
             return;
         }
         const docId = resp.data;
-        showMessage(i18n.excerptComplete + ": " + title, 3000, "info");
+        showMessage(i18n.excerptComplete + ": " + title, 3000, "info", EXCERPT_PROGRESS_ID);
 
         // 4. 图片抓取失败 → 内核网络图片转本地兜底
         if (payload.fetchFileErr && docId) {
@@ -356,6 +363,6 @@ export async function clipToSiYuan(
         }
     } catch (e: any) {
         console.error("[browser-plugin] createDoc failed:", e);
-        showMessage(i18n.excerptFailed + ": " + (e?.message || e), 4000, "error");
+        showMessage(i18n.excerptFailed + ": " + (e?.message || e), 4000, "error", EXCERPT_PROGRESS_ID);
     }
 }
