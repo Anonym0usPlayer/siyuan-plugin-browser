@@ -1202,7 +1202,14 @@ class CsPageSession {
                 if (r2.err) return { err: r2.err };
                 parsed = JSON.parse(String(r2.value));
             }
-            if (parsed && parsed.__noHandlers) return { err: "扩展 SW 无 onMessage 处理器（垫片未运行？）" };
+            if (parsed && parsed.__noHandlers) {
+                // 对齐 Chrome 语义：onMessage listener 存在但 handler 未注册/无响应 →
+                // 无响应数据（fire-and-forget 调用方无感；此前返回 err 会让调用方
+                // Uncaught "扩展 SW 无 onMessage 处理器"）。保留 warn 作诊断线索。
+                console.warn("[browser-plugin] SW 无 onMessage 处理器（垫片未运行？），func:",
+                    (() => { try { return JSON.parse(String(args.msg === undefined ? "null" : args.msg))?.func || "?"; } catch { return "?"; } })());
+                return { data: undefined };
+            }
             return { data: parsed === null ? undefined : parsed };
         } catch {
             return { data: undefined };
