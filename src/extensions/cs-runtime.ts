@@ -37,10 +37,11 @@ const BRIDGE_NAME = "__syExtHost";
 const POPUP_WORLD_PREFIX = "__syCsPop_";
 
 /** SW→CS 回程监听窗口时长（routeSendMessage 派发后轮询 SW 垫片 outbox 的时间上限）。
- *  剪藏大流程（多图下载）可远超 45s 且中途可能无 tip → 窗口必须覆盖全程，
- *  否则最后的完成 tip（tip_clip_ok）在窗口关闭后进 outbox 无人接驳，tip 永卡
- *  "剪藏中"。空转开销 = 每 600ms 一次轻量 drain（有消息时经活跃续期顺延）。 */
-const SW_REPLY_WINDOW_MS = 120_000;
+ *  剪藏大流程（多图下载）可远超短窗口且中途可能无 tip → 窗口必须覆盖全程，
+ *  否则最后的完成 tip（tip_clip_ok）在窗口关闭后进 outbox 无人接驳，滞留到
+ *  下一次剪藏开泵才补显（"剪藏成功了过很久才提醒"）。空转开销 = 每 600ms 一次
+ *  轻量 drain（有消息时经活跃续期顺延；SW 空闲回收后连续失败自动停泵）。 */
+const SW_REPLY_WINDOW_MS = 300_000;
 /** 取走 SW 垫片 v13 __syTabsOutbox 里待发往 content 世界的消息（原子取走） */
 const SW_TABS_DRAIN_EXPR = `(() => { const out = self.__syTabsOutbox || []; self.__syTabsOutbox = []; return JSON.stringify(out); })()`;
 
@@ -827,9 +828,10 @@ class CsPageSession {
             w.deadline = Date.now() + SW_REPLY_WINDOW_MS;
             return;
         }
-        const entry: { deadline: number; busy: boolean; timer: ReturnType<typeof setInterval> } = {
+        const entry: { deadline: number; busy: boolean; failCount: number; timer: ReturnType<typeof setInterval> } = {
             deadline: Date.now() + SW_REPLY_WINDOW_MS,
             busy: false,
+            failCount: 0,
             timer: null as any,
         };
         entry.timer = setInterval(() => void this.pumpSwReplies(electronId, entry), 600);
@@ -855,21 +857,26 @@ class CsPageSession {
             ]);
             let r = await evalInSwFlatCached(sender, electronId, SW_TABS_DRAIN_EXPR);
             if (r.err === SW_FLAT_UNAVAILABLE) {
-                // 缓存缺失/失效：刚处理过消息的 SW 通常仍活跃，做一次不唤醒的重找
+                // 缓存缺失/失效：SW 休眠/重启等瞬时态 —— 不立即停泵（tip 可能就在
+                // 下一次 tick 的 outbox 里，误停会让完成提示滞留到下次剪藏才补显），
+                // 连续失败 20 次（≈12s）才判定通道确实不可用
+                entry.failCount++;
+                if (entry.failCount >= 20) {
+                    this.stopSwReplyPump(electronId, entry);
+                    return;
+                }
                 const found = await findSwFlatSession(sender, electronId);
-                if (!found) {
-                    this.stopSwReplyPump(electronId, entry);
-                    return;
-                }
+                if (!found) return;
                 r = await evalInSwFlatCached(sender, electronId, SW_TABS_DRAIN_EXPR);
-                if (r.err) {
-                    this.stopSwReplyPump(electronId, entry);
-                    return;
-                }
+                if (r.err) return;
             } else if (r.err) {
-                this.stopSwReplyPump(electronId, entry);
+                entry.failCount++;
+                if (entry.failCount >= 20) {
+                    this.stopSwReplyPump(electronId, entry);
+                }
                 return;
             }
+            entry.failCount = 0;
             let reqs: any[] = [];
             try { reqs = JSON.parse(String(r.value ?? "[]")) || []; } catch {}
             if (reqs.length > 0) {
